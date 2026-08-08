@@ -47,13 +47,13 @@ class Exl3Backend:
         self.info = None
 
     def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
-        from exllamav3.modules import Linear
+        from exllamav3.modules import Embedding, Linear
         modules = self.model.modules
         states = list(ids.split(1))
         gen = torch.Generator(device = self.device)
         gen.manual_seed(1)
 
-        sum_bits = sum_numel = head_bits = head_numel = 0
+        sum_bits = sum_numel = head_bits = head_numel = embed_bits = embed_numel = 0
         with ProgressBar("Streaming", len(modules)) as pb:
             for idx, module in enumerate(modules):
                 self.config.stc.begin_deferred_load()
@@ -62,20 +62,30 @@ class Exl3Backend:
 
                 # Storage info while the module is resident. Biases are excluded from the
                 # convention; the MoE routing gate is not a Linear in exllamav3 and is thus
-                # excluded structurally
+                # excluded structurally. Embedding shares Linear's get_tensors()/weights_numel()
+                # interface but is never quantized (no qmap), so it's tallied into its own
+                # bucket rather than the layer bucket
                 if self.info is None:
                     stack = [module]
                     while stack:
                         m = stack.pop()
-                        if isinstance(m, Linear):
+                        if isinstance(m, (Linear, Embedding)):
                             bits = 8 * sum(
                                 t.element_size() * t.numel()
                                 for k, t in m.get_tensors().items()
                                 if not k.endswith(".bias")
                             )
-                            if m.key.endswith("lm_head"):
-                                head_bits += bits
-                                head_numel += m.weights_numel()
+                            if isinstance(m, Embedding):
+                                embed_bits += bits
+                                embed_numel += m.weights_numel()
+                            elif m.key.endswith("lm_head"):
+                                # A tied checkpoint may carry no tensor of its own under this
+                                # key; the module then aliases the embedding's storage via
+                                # alt_key instead of adding bytes, so it's left uncounted here
+                                # and picked up by the tied-head fallback below instead
+                                if self.config.stc.has_tensor(m.key):
+                                    head_bits += bits
+                                    head_numel += m.weights_numel()
                             else:
                                 sum_bits += bits
                                 sum_numel += m.weights_numel()
@@ -101,10 +111,16 @@ class Exl3Backend:
                 free_mem()
                 pb.update(idx + 1)
 
+        tied_head = head_numel == 0
+        if tied_head:
+            # Tied embeddings: the head is served by the embedding matrix, so its bytes must
+            # not also be added under embed_bits below (same storage, not two allocations)
+            head_bits, head_numel = embed_bits, embed_numel
         self.info = {
             "bpw_layer": sum_bits / max(sum_numel, 1),
             "bpw_head": head_bits / max(head_numel, 1),
-            "vram_gb": (sum_bits + head_bits) / 8 / 1024 ** 3,
+            "bpw_embed": embed_bits / max(embed_numel, 1),
+            "vram_gb": (sum_bits + head_bits + (0 if tied_head else embed_bits)) / 8 / 1024 ** 3,
         }
 
     def close(self):
@@ -376,13 +392,16 @@ class TransformersBackend:
             elif p.ndim >= 2 and not any(k in name for k in HF_ROUTER_KEYS):
                 sum_bits += bits
                 sum_numel += p.numel()
-        if head_numel == 0:
-            # Tied embeddings: the head is served by the embedding matrix
+        tied_head = head_numel == 0
+        if tied_head:
+            # Tied embeddings: the head is served by the embedding matrix, so its bytes must
+            # not also be added under embed_bits below (same storage, not two allocations)
             head_bits, head_numel = embed_bits, embed_numel
         self.info = {
             "bpw_layer": sum_bits / max(sum_numel, 1),
             "bpw_head": head_bits / max(head_numel, 1),
-            "vram_gb": (sum_bits + head_bits) / 8 / 1024 ** 3,
+            "bpw_embed": embed_bits / max(embed_numel, 1),
+            "vram_gb": (sum_bits + head_bits + (0 if tied_head else embed_bits)) / 8 / 1024 ** 3,
         }
 
     def _decoder_layers(self):
@@ -795,22 +814,28 @@ def gguf_shards(source: str) -> list:
 
 def gguf_storage_info(source: str) -> dict:
     """bpw/vram accounting over the full tensor table, spanning all shards of a split GGUF.
-    Norms/biases are < 2 dims; router gates excluded by name; token_embd serves as the head
-    fallback for tied models, overridden by output.weight when present in any shard"""
+    Norms/biases are < 2 dims; router gates excluded by name; token_embd is tallied under its
+    own bucket and also serves as the head fallback for tied models (not double-counted:
+    head_is_fallback tracks whether output.weight has since overridden it), overridden by
+    output.weight when present in any shard"""
     from gguf import GGUFReader
-    sum_bits = sum_numel = head_bits = head_numel = 0
+    sum_bits = sum_numel = head_bits = head_numel = embed_bits = embed_numel = 0
     head_is_fallback = True
     for shard in gguf_shards(source):
         reader = GGUFReader(shard)
         for t in reader.tensors:
-            if t.name == "output.weight" or (t.name == "token_embd.weight" and head_is_fallback):
+            if t.name == "token_embd.weight":
+                embed_bits += t.n_bytes * 8
+                embed_numel += t.n_elements
+                if head_is_fallback:
+                    head_bits = t.n_bytes * 8
+                    head_numel = t.n_elements
+            elif t.name == "output.weight":
                 head_bits = t.n_bytes * 8
                 head_numel = t.n_elements
-                if t.name == "output.weight":
-                    head_is_fallback = False
+                head_is_fallback = False
             elif (
                 t.name.endswith(".weight")
-                and t.name != "token_embd.weight"
                 and len(t.shape) >= 2
                 and not any(k in t.name for k in GGUF_ROUTER_KEYS)
             ):
@@ -820,7 +845,8 @@ def gguf_storage_info(source: str) -> dict:
     return {
         "bpw_layer": sum_bits / max(sum_numel, 1),
         "bpw_head": head_bits / max(head_numel, 1),
-        "vram_gb": (sum_bits + head_bits) / 8 / 1024 ** 3,
+        "bpw_embed": embed_bits / max(embed_numel, 1),
+        "vram_gb": (sum_bits + head_bits + (0 if head_is_fallback else embed_bits)) / 8 / 1024 ** 3,
     }
 
 
