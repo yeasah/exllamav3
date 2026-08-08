@@ -92,7 +92,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
     int bszm = MAX(bszm_in, bszm_out);
     auto grid = cg::this_grid();
 
-    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
+    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890) && defined(EXL3_SM90_BARRIER)
         int* barrier_counters_sense = locks + BARRIER_LOCKS_OFFSET;
     #endif
 
@@ -163,7 +163,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                 );
         }
 
-        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
+        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890) && defined(EXL3_SM90_BARRIER)
             group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
         #else
             grid.sync();
@@ -198,7 +198,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             else                  C_ = (void*) (((half*) C_) + 16 * n_j);
             size_m_ -= 16;
 
-            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
+            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890) && defined(EXL3_SM90_BARRIER)
                 group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
             #else
                 grid.sync();

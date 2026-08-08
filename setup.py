@@ -48,6 +48,16 @@ if cuda_host_cxx := os.environ.get("CUDAHOSTCXX"):
 if torch and torch_version.hip:
     extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
 
+# On sm_90+ the GEMM kernels can use a hand-rolled sense-reversing barrier
+# (group_barrier) in place of cooperative-groups grid.sync(). It synchronizes
+# through the device-global `locks` buffer, which is shared across every launch
+# and zeroed only once at allocation, and it deadlocks under vLLM: MoE models
+# hang mid-generation with the GPU pinned at 100%. Off by default here; set
+# EXL3_SM90_BARRIER=1 to build with it.
+if os.environ.get("EXL3_SM90_BARRIER"):
+    extra_cuda_cflags += ["-DEXL3_SM90_BARRIER"]
+    extra_cflags += ["-DEXL3_SM90_BARRIER"]
+
 extra_compile_args = {
     "cxx": extra_cflags,
     "nvcc": extra_cuda_cflags,

@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include "exl3_gemm.cuh"
 
@@ -613,7 +615,29 @@ int exl3_mgemm_gr
         kernel_attr_set[device].insert((void*) kernel);
     }
 
-    cudaLaunchCooperativeKernel
+    // exl3_mgemm_kernel synchronizes its blocks with a sense-reversing barrier
+    // (group_barrier over gridDim.x, one group per blockIdx.z), so every block
+    // of the grid must be resident simultaneously or the survivors spin
+    // forever. The grid above is sized on the assumption that one block occupies
+    // one SM; if the kernel's real occupancy is lower, that assumption is wrong
+    // and the launch deadlocks rather than failing. Report what actually fits.
+    static const bool exl3_diag = getenv("EXL3_DIAG_GRID") != nullptr;
+    if (exl3_diag)
+    {
+        int blocks_per_sm = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor
+            (&blocks_per_sm, (void*) kernel, block_dim, SMEM_MAX);
+        int grid_blocks = num_sms * concurrency;
+        int resident_max = blocks_per_sm * total_sms;
+        printf("[exl3 grid] m=%d k=%d n=%d K=%d bszm=%d/%d shape=%d bdim=%d "
+               "grid=%dx%d=%d blocks_per_sm=%d resident_max=%d smem=%d%s\n",
+               size_m, size_k, size_n, K, bszm_in, bszm_out, shape_idx, block_dim,
+               num_sms, concurrency, grid_blocks, blocks_per_sm, resident_max,
+               (int) SMEM_MAX, grid_blocks > resident_max ? "  <-- CANNOT BE CO-RESIDENT" : "");
+        fflush(stdout);
+    }
+
+    cuda_check(cudaLaunchCooperativeKernel
     (
         (void*) kernel,
         block_grid,
@@ -621,7 +645,7 @@ int exl3_mgemm_gr
         kernelArgs,
         SMEM_MAX,
         stream
-    );
+    ));
     add_graph_args((void*) kernel);
 
     cuda_check(cudaPeekAtLastError());
