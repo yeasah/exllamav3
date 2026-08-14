@@ -35,6 +35,27 @@ def apply_mult_noise(x: torch.Tensor, eps: float, gen: torch.Generator) -> torch
     return (x.float() * (1.0 + eps * n)).to(x.dtype)
 
 
+def fake_quantize(x: torch.Tensor, bits: int, granularity: str = "per_row") -> torch.Tensor:
+    """Round x to a uniform bits-bit grid and immediately dequantize, in place of dtype/storage
+    changes - lets a sweep characterize sensitivity to a given precision level (is there a knee,
+    where) without committing to a real packed format or a real kernel. "per_row" scales each row
+    (e.g. one embedding vector) by its own min/max: the floor for quantization done reasonably,
+    not the pathological case a single tensor-wide scale would give."""
+    levels = 2 ** bits - 1
+    xf = x.float()
+    if granularity == "per_row":
+        lo = xf.amin(dim = -1, keepdim = True)
+        hi = xf.amax(dim = -1, keepdim = True)
+    elif granularity == "per_tensor":
+        lo = xf.amin()
+        hi = xf.amax()
+    else:
+        raise ValueError(f"Unknown granularity: {granularity}")
+    scale = (hi - lo).clamp_min(1e-12) / levels
+    q = ((xf - lo) / scale).round().clamp(0, levels)
+    return (q * scale + lo).to(x.dtype)
+
+
 class Exl3Backend:
     """Module-streamed exllamav3 pass (model_diff style): one module resident at a time"""
 
@@ -45,6 +66,10 @@ class Exl3Backend:
         self.config.override_dynamic_seq_len(max_len)
         self.model = Model.from_config(self.config)
         self.info = None
+        # Simulated embedding precision, for characterizing sensitivity independent of any real
+        # storage format: {"bits": int, "granularity": "per_row"|"per_tensor"} or None to leave
+        # the checkpoint's real (always fp16) embedding untouched
+        self.embed_quant = options.get("embed_quant")
 
     def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
         from exllamav3.modules import Embedding, Linear
@@ -59,6 +84,13 @@ class Exl3Backend:
                 self.config.stc.begin_deferred_load()
                 module.load(self.device if not module.caps.get("prefer_cpu") else "cpu")
                 self.config.stc.end_deferred_load()
+
+                if self.embed_quant and isinstance(module, Embedding):
+                    module.embedding.weight.data = fake_quantize(
+                        module.embedding.weight.data,
+                        self.embed_quant["bits"],
+                        self.embed_quant.get("granularity", "per_row"),
+                    )
 
                 # Storage info while the module is resident. Biases are excluded from the
                 # convention; the MoE routing gate is not a Linear in exllamav3 and is thus
@@ -889,10 +921,357 @@ class LlamaCppBackend:
         free_mem()
 
 
+# ------ vLLM engine ------------------------------------------------------------------
+#
+# vLLM's public prompt_logprobs API is built for a UI's top-k display, not a dense
+# [tokens, vocab] dump: asking for the full vocabulary (prompt_logprobs=-1) still makes
+# every downstream consumer build one Python object per (position, vocab entry) --
+# hundreds of millions of them for one 2048-token row -- which is unusable at qbench's
+# scale. The raw tensor exists for exactly one step before that happens, common to every
+# model runner variant: vllm.v1.engine.logprobs.LogprobsProcessor._update_prompt_logprobs
+# is the single place EngineCoreOutput.new_prompt_logprobs_tensors gets pythonized.
+# Hooking it and handing the original a width-1 stand-in keeps the rest of vLLM's output
+# pipeline doing O(1) work per position, while this keeps the real tensor.
+#
+# Two load-bearing pieces this depends on, worth knowing if a vLLM bump breaks it:
+#  - VLLM_ENABLE_V1_MULTIPROCESSING=0 keeps EngineCore in this process, or the patched
+#    class is never the one the actual serving code touches (it lives in a subprocess by
+#    default).
+#  - logprobs_mode="raw_logits" (engine-level, ModelConfig) skips softmax and any
+#    temperature/top-p processing entirely, so what's captured is the model's literal
+#    pre-softmax output -- matching every other backend's convention here. A full-vocab
+#    request is still internally top-k sorted (torch.topk over the whole vocab), so the
+#    recovered tensor needs one scatter by token id to land back in natural vocab order.
+#
+# The other half of the row (the position after the last prompt token) never goes through
+# prompt_logprobs at all -- vLLM only scores it if something asks it to generate, which is
+# exactly what max_tokens=1 is for. Its full-vocab distribution comes back through the
+# ordinary sample-logprobs path instead. That path is left functionally untouched (one
+# Python dict per row is cheap -- it happens once per row, not once per position, unlike
+# the prompt side) but is still observed, so this row's callback can fire the moment both
+# halves exist, rather than after the whole batch's generate() call returns. Doing the
+# handoff eagerly is what keeps this backend from holding every row's full-vocab tensor in
+# memory at once: at qbench's usual scale (10 rows, 2048 tokens, a 150-256k vocab) that's
+# tens of GB, not something to leave sitting around as a side effect of API convenience.
+#
+# EngineCoreOutput.update_from_output calls _update_sample_logprobs before
+# _update_prompt_logprobs (sample first, prompt second) -- the reverse of what the names'
+# reading order suggests. Rather than depend on that, whichever hook sees its half of a row
+# arrive first stashes it and the other one finalizes, so this doesn't silently break again
+# if a future vLLM reorders those two calls.
+
+_VLLM_HOOK_INSTALLED = False
+
+
+def _install_vllm_prompt_logprob_hook():
+    global _VLLM_HOOK_INSTALLED
+    if _VLLM_HOOK_INSTALLED:
+        return
+    import vllm.v1.engine.logprobs as lp_mod
+    from vllm.v1.outputs import LogprobsTensors
+
+    orig_from_new_request = lp_mod.LogprobsProcessor.from_new_request.__func__
+    orig_update_prompt = lp_mod.LogprobsProcessor._update_prompt_logprobs
+    orig_update_sample = lp_mod.LogprobsProcessor._update_sample_logprobs
+
+    def patched_from_new_request(cls, tokenizer, request):
+        proc = orig_from_new_request(cls, tokenizer, request)
+        # EngineCoreRequest.request_id is a "{parent}-{suffix}" child id; callers only
+        # ever see the parent id (RequestOutput.request_id), which is what run() keys on.
+        proc._qbench_req_id = request.request_id.split("-")[0]
+        return proc
+
+    def patched_update_prompt(self, prompt_logprobs_tensors):
+        token_ids, logprobs, ranks, _ = prompt_logprobs_tensors
+        rid = getattr(self, "_qbench_req_id", None)
+        rows = _VLLM_RUN_CTX.get("rows")
+        if rows is not None and rid in rows:
+            dense = torch.full((token_ids.shape[0], _VLLM_RUN_CTX["vocab"]), float("-inf"))
+            dense.scatter_(-1, token_ids.to(torch.int64).clamp_max(_VLLM_RUN_CTX["vocab"] - 1),
+                            logprobs.float())
+            # update_from_output runs _update_sample_logprobs before this method, so the
+            # last-row piece (below) is typically already waiting -- finalize and fire the
+            # callback here rather than there.
+            if rid in _VLLM_SAMPLE_PARTS:
+                _finish_row(rid, dense, _VLLM_SAMPLE_PARTS.pop(rid))
+            else:
+                _VLLM_PROMPT_PARTS[rid] = dense
+        truncated = LogprobsTensors(
+            logprob_token_ids=token_ids[:, :1],
+            logprobs=logprobs[:, :1],
+            selected_token_ranks=ranks,
+        )
+        return orig_update_prompt(self, truncated)
+
+    def patched_update_sample(self, logprobs_lists):
+        result = orig_update_sample(self, logprobs_lists)
+        rid = getattr(self, "_qbench_req_id", None)
+        rows = _VLLM_RUN_CTX.get("rows")
+        if rows is not None and rid in rows:
+            vocab = _VLLM_RUN_CTX["vocab"]
+            last = torch.full((1, vocab), float("-inf"))
+            gen_lp = self.logprobs[-1] if self.logprobs else {}
+            for tok_id, lp in (gen_lp or {}).items():
+                if tok_id < vocab:
+                    last[0, tok_id] = lp.logprob
+            if rid in _VLLM_PROMPT_PARTS:
+                _finish_row(rid, _VLLM_PROMPT_PARTS.pop(rid), last)
+            else:
+                _VLLM_SAMPLE_PARTS[rid] = last
+        return result
+
+    def _finish_row(rid, prompt_part, last_row):
+        vocab = _VLLM_RUN_CTX["vocab"]
+        length = _VLLM_RUN_CTX["length"]
+        full = torch.cat([prompt_part, last_row], dim=0)
+        if full.shape[0] < length:
+            full = torch.cat([full, full.new_full((length - full.shape[0], vocab), float("-inf"))])
+        full = full[:length].unsqueeze(0).to(_VLLM_RUN_CTX["device"])
+        _VLLM_RUN_CTX["callback"](_VLLM_RUN_CTX["rows"][rid], full)
+
+    lp_mod.LogprobsProcessor.from_new_request = classmethod(patched_from_new_request)
+    lp_mod.LogprobsProcessor._update_prompt_logprobs = patched_update_prompt
+    lp_mod.LogprobsProcessor._update_sample_logprobs = patched_update_sample
+    _VLLM_HOOK_INSTALLED = True
+
+
+# State for whichever VllmBackend.run() call is currently in flight. Module-level because
+# the patched methods above are bound to vLLM's own class, not to any VllmBackend instance;
+# only one run() is ever active at a time (qbench runs engines sequentially), so this is a
+# single slot rather than something keyed by backend instance.
+_VLLM_RUN_CTX: dict = {}          # {"rows": {req_id: row_idx}, "vocab", "length", "device", "callback"}
+_VLLM_PROMPT_PARTS: dict = {}     # req_id -> this row's [length-1, vocab] dense tensor, so far
+_VLLM_SAMPLE_PARTS: dict = {}     # req_id -> the [1, vocab] last-row piece, whichever hook sees it first
+
+
+# Suffix -> logical module key, covering the on-disk conventions the engines this project
+# actually compares understand: compressed-tensors (AWQ/GPTQ/FP8/NVFP4 via vLLM) and this
+# project's own EXL3 plugin. Order doesn't matter (longest match isn't ambiguous here --
+# no suffix is a prefix of another), but every one of them must be tried before the bare
+# "weight" fallback. Duplicated here as plain strings rather than imported from
+# vllm_exl3_plugin.format, so qbench keeps working standalone in exllamav3's own repo.
+_CT_SUFFIXES = ("weight_packed", "weight_scale_inv", "weight_scale_2", "weight_scale",
+                "weight_zero_point", "weight_shape", "weight_g_idx", "weight_global_scale",
+                "input_global_scale", "input_scale", "scale")
+_EXL3_SUFFIXES = ("trellis", "suh", "svh", "mcg", "mul1", "su", "sv")
+_KNOWN_SUFFIXES = _CT_SUFFIXES + _EXL3_SUFFIXES + ("weight",)
+
+
+def _safetensors_headers(source: str) -> dict:
+    """checkpoint tensor name -> (nbytes, shape, dtype, path, data_start), reading only
+    shard headers. data_start is the absolute file offset of the tensor's own bytes, for
+    the rare case (compressed-tensors' *.weight_shape) where a tensor's *contents*, not
+    just its header shape, are needed -- those are always a couple of int values, cheap to
+    seek-and-read directly without touching the (potentially huge) rest of the shard."""
+    import json
+    import struct
+    index_file = os.path.join(source, "model.safetensors.index.json")
+    if os.path.exists(index_file):
+        with open(index_file) as f:
+            files = set(json.load(f)["weight_map"].values())
+    else:
+        files = {"model.safetensors"}
+    out = {}
+    for fn in files:
+        path = os.path.join(source, fn)
+        with open(path, "rb") as f:
+            hdr_len = struct.unpack("<Q", f.read(8))[0]
+            hdr = json.loads(f.read(hdr_len))
+            data_start = 8 + hdr_len
+        for k, v in hdr.items():
+            if k == "__metadata__":
+                continue
+            a, b = v["data_offsets"]
+            out[k] = (b - a, v.get("shape", []), v.get("dtype"), path, data_start + a)
+    return out
+
+
+_ST_DTYPES = {"I64": "<q", "I32": "<i", "I16": "<h", "U64": "<Q", "U32": "<I", "U16": "<H"}
+
+
+def _read_small_int_tensor(path: str, offset: int, nbytes: int, dtype: str) -> list:
+    """Read a tiny integer tensor's actual values directly off disk (a targeted seek, not
+    a full tensor load) -- used only for compressed-tensors' *.weight_shape sidecars,
+    which store the true unpacked [out, in] as 2 int values rather than as their own
+    on-disk shape."""
+    import struct
+    fmt = _ST_DTYPES.get(dtype)
+    if fmt is None:
+        return []
+    n = nbytes // struct.calcsize(fmt)
+    with open(path, "rb") as f:
+        f.seek(offset)
+        return list(struct.unpack(f"<{n}{fmt[-1]}", f.read(nbytes)))
+
+
+def safetensors_storage_info(source: str) -> dict:
+    """bpw/vram accounting straight off an HF-repo checkpoint's own stored bytes, for any
+    vLLM-loadable safetensors model: plain bf16/fp16, compressed-tensors (AWQ/GPTQ/FP8/
+    NVFP4), or EXL3 via this project's plugin. Same convention as gguf_storage_info:
+    norms/biases excluded, router gates excluded by name, token embeddings tallied
+    separately and used as the head's fallback for tied models.
+
+    A tensor whose suffix isn't recognized is bucketed under its own full name and
+    treated as ndim < 2 (i.e. dropped), so an unknown format undercounts rather than
+    crashing or silently merging into the wrong bucket. Precise for what this project
+    actually compares today; extend _CT_SUFFIXES/_EXL3_SUFFIXES for a new one.
+    """
+    headers = _safetensors_headers(source)
+    TILE = 16  # EXL3 trellis is tile-granular on both dims (vllm_exl3_plugin/format.py)
+
+    # module_key -> [bits, has_ct_sidecar, trellis_shape (or None), plain_weight_shape,
+    #                 weight_shape_payload (the *values* stored in a .weight_shape sidecar)]
+    modules: dict = {}
+    for name, (nbytes, shape, dtype, path, offset) in headers.items():
+        if name.endswith(".bias"):
+            continue
+        module_key, suffix = name, None
+        for suf in _KNOWN_SUFFIXES:
+            if name.endswith("." + suf):
+                module_key, suffix = name[: -(len(suf) + 1)], suf
+                break
+        m = modules.setdefault(module_key, [0, False, None, None, None])
+        m[0] += nbytes * 8
+        if suffix in _CT_SUFFIXES:
+            m[1] = True
+        if suffix == "trellis":
+            m[2] = shape
+        elif suffix == "weight":
+            m[3] = shape
+        elif suffix == "weight_shape":
+            # Not the tensor's own on-disk shape (that's just "[2]") -- its *contents* are
+            # the true unpacked [out, in] compressed-tensors reports for a packed weight.
+            m[4] = _read_small_int_tensor(path, offset, nbytes, dtype)
+
+    sum_bits = sum_numel = head_bits = head_numel = embed_bits = embed_numel = 0
+    head_is_fallback = True
+    for module_key, (bits, has_ct, trellis_shape, weight_shape, packed_shape) in modules.items():
+        if any(k in module_key for k in HF_ROUTER_KEYS):
+            continue
+        is_embed = module_key.endswith("embed_tokens") or module_key.endswith(".wte")
+        is_head = module_key.endswith("lm_head") or module_key.split(".")[-1] == "output"
+
+        if trellis_shape is not None:
+            numel = trellis_shape[0] * TILE * trellis_shape[1] * TILE
+        elif packed_shape:
+            numel = 1
+            for d in packed_shape:
+                numel *= d
+        elif weight_shape is not None and len(weight_shape) >= 2:
+            numel = 1
+            for d in weight_shape:
+                numel *= d
+        else:
+            numel = 0  # norm, bias-only, or something this function doesn't recognize
+
+        if not numel:
+            continue
+        if is_embed:
+            embed_bits += bits
+            embed_numel += numel
+            if head_is_fallback:
+                head_bits, head_numel = bits, numel
+        elif is_head:
+            head_bits, head_numel = bits, numel
+            head_is_fallback = False
+        else:
+            sum_bits += bits
+            sum_numel += numel
+
+    return {
+        "bpw_layer": sum_bits / max(sum_numel, 1),
+        "bpw_head": head_bits / max(head_numel, 1),
+        "bpw_embed": embed_bits / max(embed_numel, 1),
+        "vram_gb": (sum_bits + head_bits + (0 if head_is_fallback else embed_bits)) / 8 / 1024 ** 3,
+    }
+
+
+class VllmBackend:
+    """vLLM engine, via the offline LLM API. Exists mainly to compare this project's own
+    EXL3 vLLM plugin -- and other vLLM-servable quant formats (AWQ, GPTQ, FP8, ...) -- to
+    exllamav3 native and the transformers reference under one methodology, on the actual
+    served code path rather than a proxy for it.
+
+    options: anything accepted by vllm.LLM (quantization, gpu_memory_utilization,
+    enforce_eager, tensor_parallel_size, dtype, ...) is passed straight through.
+
+    Noise injection (the self-noise-floor pass) is not implemented: unlike
+    TransformersBackend's forward-hook approach, vLLM's decoder layers aren't at a
+    predictable, engine-version-stable location. Don't put a vllm-engine model in the
+    'reference' group with noise_floor left at its default (true), or set
+    `noise_floor: false` in the project.
+    """
+
+    def __init__(self, source: str, max_len: int, device: torch.device, options: dict):
+        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+        _install_vllm_prompt_logprob_hook()
+
+        self.info = safetensors_storage_info(source)
+        self.device = device
+
+        from vllm import LLM
+        llm_kwargs = dict(options)
+        llm_kwargs.setdefault("gpu_memory_utilization", 0.85)
+        llm_kwargs.setdefault("enforce_eager", True)
+        self.llm = LLM(
+            model=source,
+            max_model_len=max_len,
+            logprobs_mode="raw_logits",
+            max_logprobs=-1,
+            disable_log_stats=True,
+            **llm_kwargs,
+        )
+        self.vocab_size = self.llm.llm_engine.model_config.get_vocab_size()
+
+    def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
+        assert not noise_eps, "Noise injection not supported for the vllm engine"
+        from vllm import SamplingParams
+
+        rows = ids.shape[0]
+        length = ids.shape[1]
+        pb = ProgressBar("Evaluating", rows)
+        done = {"n": 0}
+
+        def wrapped_callback(r, logits):
+            callback(r, logits)
+            done["n"] += 1
+            pb.update(done["n"])
+
+        # Row index keyed by request_id ("0".."rows-1" in submission order -- vLLM's
+        # offline API assigns ids that way for a single generate() call), so the hooks
+        # above can fire wrapped_callback the moment each row finishes, rather than this
+        # function collecting every row's full-vocab tensor before any of them run.
+        _VLLM_RUN_CTX.update(rows={str(r): r for r in range(rows)}, vocab=self.vocab_size,
+                              length=length, device=self.device, callback=wrapped_callback)
+        _VLLM_PROMPT_PARTS.clear()
+        _VLLM_SAMPLE_PARTS.clear()
+
+        sp = SamplingParams(max_tokens=1, temperature=0.0, logprobs=-1, prompt_logprobs=-1,
+                             detokenize=False)
+        try:
+            with pb:
+                self.llm.generate(prompts=[ids[r].tolist() for r in range(rows)],
+                                   sampling_params=sp, use_tqdm=False)
+        finally:
+            _VLLM_RUN_CTX.clear()
+            _VLLM_PROMPT_PARTS.clear()
+            _VLLM_SAMPLE_PARTS.clear()
+
+        assert done["n"] == rows, (
+            f"vllm engine: only {done['n']}/{rows} rows produced logits -- a row generated "
+            "0 tokens (EOS on its first position?) or the sample-logprobs hook didn't fire"
+        )
+
+    def close(self):
+        del self.llm
+        free_mem()
+
+
 ENGINES = {
     "exllamav3": Exl3Backend,
     "transformers": TransformersBackend,
     "llamacpp": LlamaCppBackend,
+    "vllm": VllmBackend,
 }
 
 

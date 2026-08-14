@@ -31,7 +31,7 @@ models:
     # Group name is arbitrary. Only 'reference' group is special, defining which model to use as the ground truth
     # for KL-div computation and baseline ppl. Usually this would be the HF checkpoint
     group: reference
-    # Choices: transformers, exllamav3, llamacpp
+    # Choices: transformers, exllamav3, llamacpp, vllm
     engine: transformers
     source: hf_model/
     options:
@@ -48,6 +48,23 @@ models:
     group: EXL3
     engine: exllamav3
     source: exl3/4.00bpw/
+
+  # Same EXL3 checkpoints, but served through vllm + vllm-exl3-plugin instead of native
+  # exllamav3 -- the point being to compare the actually-served path, not just the
+  # reference kernel implementation. noise_floor only applies to the reference model, so
+  # it's irrelevant here; vllm just can't itself be the reference (see VllmBackend's
+  # docstring in qbench/engines.py).
+  - label: 4.00 bpw (vllm)
+    group: EXL3 via vllm
+    engine: vllm
+    source: exl3/4.00bpw/
+    options:
+      gpu_memory_utilization: 0.6
+
+  - label: AWQ 4-bit
+    group: AWQ
+    engine: vllm
+    source: awq/
 
   - label: Q4_K_M
     group: GGUF
