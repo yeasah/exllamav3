@@ -692,7 +692,7 @@ def plot_scatter(results, args, ref_line = None):
     x_key = "vram_gb" if args.vram else "layer_bpw"
     y_key = "kld" if args.kld else "ppl"
     x_label = (
-        r"quantized weight size $|W_q|$ / GiB (excl. embeddings, incl. output head)" if args.vram else
+        r"quantized weight size $|W_q|$ / GiB (incl. embeddings and output head)" if args.vram else
         r"bits per weight (excl. embeddings and output head)"
     )
     y_label = (
@@ -989,7 +989,7 @@ def plot_kld_spread(results: list, title: str, subtitle: str, dark: bool, plot_f
 
     ax.set_yscale("log")
     ax.set_xlabel(
-        r"quantized weight size $|W_q|$ / GiB (excl. embeddings, incl. output head)" if vram else
+        r"quantized weight size $|W_q|$ / GiB (incl. embeddings and output head)" if vram else
         r"bits per weight (excl. embeddings and output head)"
     )
     ax.set_ylabel(r"per-token KL divergence, $D_{\mathrm{KL}}(p_{\mathrm{FP}} \parallel p_{\mathrm{quant}})$")
