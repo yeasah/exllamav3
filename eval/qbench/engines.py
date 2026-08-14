@@ -1096,7 +1096,16 @@ _CT_SUFFIXES = ("weight_packed", "weight_scale_inv", "weight_scale_2", "weight_s
                 "weight_zero_point", "weight_shape", "weight_g_idx", "weight_global_scale",
                 "input_global_scale", "input_scale", "scale")
 _EXL3_SUFFIXES = ("trellis", "suh", "svh", "mcg", "mul1", "su", "sv")
-_KNOWN_SUFFIXES = _CT_SUFFIXES + _EXL3_SUFFIXES + ("weight",)
+# Classic GPTQ/AWQ (autogptq, autoawq, auto-round, ...), which predate compressed-tensors
+# and name nothing the same way: an int-packed `qweight` plus `scales`/`qzeros`/`g_idx`
+# sidecars, and no `weight`/`weight_shape` anywhere. Distinct enough from _CT_SUFFIXES
+# that the two never collide ("scales" is not "scale", ".g_idx" is not ".weight_g_idx").
+_GPTQ_SUFFIXES = ("qweight", "qzeros", "scales", "g_idx")
+_KNOWN_SUFFIXES = _CT_SUFFIXES + _EXL3_SUFFIXES + _GPTQ_SUFFIXES + ("weight",)
+
+#: Bits per stored element, for recovering an int-packed tensor's logical element count.
+_ST_DTYPE_BITS = {"I64": 64, "U64": 64, "I32": 32, "U32": 32, "I16": 16, "U16": 16,
+                  "I8": 8, "U8": 8, "F64": 64, "F32": 32, "F16": 16, "BF16": 16}
 
 
 def _safetensors_headers(source: str) -> dict:
@@ -1146,17 +1155,32 @@ def _read_small_int_tensor(path: str, offset: int, nbytes: int, dtype: str) -> l
         return list(struct.unpack(f"<{n}{fmt[-1]}", f.read(nbytes)))
 
 
-def _tie_word_embeddings(source: str) -> bool:
-    """config.json's tie_word_embeddings, checked under text_config too for multimodal
-    wrappers (mirrors TransformersBackend's own text_config-or-config fallback)."""
+def _read_config(source: str) -> dict:
     import json
     try:
         with open(os.path.join(source, "config.json")) as f:
-            config = json.load(f)
+            return json.load(f)
     except (OSError, json.JSONDecodeError):
-        return False
+        return {}
+
+
+def _tie_word_embeddings(config: dict) -> bool:
+    """config.json's tie_word_embeddings, checked under text_config too for multimodal
+    wrappers (mirrors TransformersBackend's own text_config-or-config fallback)."""
     text_config = config.get("text_config") or config
     return bool(text_config.get("tie_word_embeddings", config.get("tie_word_embeddings", False)))
+
+
+def _quant_bits(config: dict) -> int | None:
+    """Weight bit width from a GPTQ/AWQ-style quantization_config, which is the only place
+    it is recorded -- unlike EXL3 (bit width recoverable from the trellis shape) or
+    compressed-tensors (which ships an explicit weight_shape sidecar), an int-packed
+    `qweight` cannot be un-packed to a logical element count without knowing it."""
+    qc = config.get("quantization_config")
+    if not isinstance(qc, dict):
+        return None
+    bits = qc.get("bits") or qc.get("w_bit") or qc.get("weight_bits")
+    return int(bits) if isinstance(bits, (int, float)) and 1 <= bits <= 16 else None
 
 
 def safetensors_storage_info(source: str) -> dict:
@@ -1176,15 +1200,20 @@ def safetensors_storage_info(source: str) -> dict:
 
     A tensor whose suffix isn't recognized is bucketed under its own full name and
     treated as ndim < 2 (i.e. dropped), so an unknown format undercounts rather than
-    crashing or silently merging into the wrong bucket. Precise for what this project
-    actually compares today; extend _CT_SUFFIXES/_EXL3_SUFFIXES for a new one.
+    crashing or silently merging into the wrong bucket -- quietly, which is a real hazard:
+    a format whose weights are named in a way none of the suffix tables know reports
+    bpw_layer=0.0 and a vram_gb covering only the embedding. Precise for what this project
+    actually compares today; extend _CT_SUFFIXES/_EXL3_SUFFIXES/_GPTQ_SUFFIXES for a new
+    one, and check bpw_layer is non-zero when first pointing this at an unfamiliar format.
     """
-    tied = _tie_word_embeddings(source)
+    config = _read_config(source)
+    tied = _tie_word_embeddings(config)
+    quant_bits = _quant_bits(config)
     headers = _safetensors_headers(source)
     TILE = 16  # EXL3 trellis is tile-granular on both dims (vllm_exl3_plugin/format.py)
 
-    # module_key -> [bits, has_ct_sidecar, trellis_shape (or None), plain_weight_shape,
-    #                 weight_shape_payload (the *values* stored in a .weight_shape sidecar)]
+    # module_key -> [bits, trellis_shape, plain_weight_shape, weight_shape_payload (the
+    #                *values* in a compressed-tensors .weight_shape sidecar), qweight]
     modules: dict = {}
     for name, (nbytes, shape, dtype, path, offset) in headers.items():
         if name.endswith(".bias"):
@@ -1194,22 +1223,22 @@ def safetensors_storage_info(source: str) -> dict:
             if name.endswith("." + suf):
                 module_key, suffix = name[: -(len(suf) + 1)], suf
                 break
-        m = modules.setdefault(module_key, [0, False, None, None, None])
+        m = modules.setdefault(module_key, [0, None, None, None, None])
         m[0] += nbytes * 8
-        if suffix in _CT_SUFFIXES:
-            m[1] = True
         if suffix == "trellis":
-            m[2] = shape
+            m[1] = shape
         elif suffix == "weight":
-            m[3] = shape
+            m[2] = shape
         elif suffix == "weight_shape":
             # Not the tensor's own on-disk shape (that's just "[2]") -- its *contents* are
             # the true unpacked [out, in] compressed-tensors reports for a packed weight.
-            m[4] = _read_small_int_tensor(path, offset, nbytes, dtype)
+            m[3] = _read_small_int_tensor(path, offset, nbytes, dtype)
+        elif suffix == "qweight":
+            m[4] = (shape, dtype)
 
     sum_bits = sum_numel = head_bits = head_numel = embed_bits = embed_numel = 0
     head_is_fallback = True
-    for module_key, (bits, has_ct, trellis_shape, weight_shape, packed_shape) in modules.items():
+    for module_key, (bits, trellis_shape, weight_shape, packed_shape, qweight) in modules.items():
         if any(k in module_key for k in HF_ROUTER_KEYS):
             continue
         is_embed = module_key.endswith("embed_tokens") or module_key.endswith(".wte")
@@ -1223,6 +1252,18 @@ def safetensors_storage_info(source: str) -> dict:
             numel = 1
             for d in packed_shape:
                 numel *= d
+        elif qweight is not None and quant_bits:
+            # GPTQ/AWQ: `qweight` holds in_features * out_features weights bit-packed into
+            # a wider int, and the two formats disagree on which axis they pack along
+            # (GPTQ [in/8, out], AWQ [in, out/8] at 4 bits). Total stored elements times
+            # the packing factor is the same either way, so this needs no per-format
+            # branch -- only the bit width, which is why quant_bits gates it.
+            qshape, qdtype = qweight
+            per_element = _ST_DTYPE_BITS.get(qdtype, 0) // quant_bits
+            numel = 1
+            for d in qshape:
+                numel *= d
+            numel *= per_element
         elif weight_shape is not None and len(weight_shape) >= 2:
             numel = 1
             for d in weight_shape:
@@ -1336,7 +1377,31 @@ class VllmBackend:
         )
 
     def close(self):
+        """Release the GPU for the next model in the project.
+
+        `del self.llm` alone frees almost nothing (measured: 8162 -> 8102 MiB, i.e. the
+        entire KV cache reservation stays resident), because vLLM keeps the engine's
+        worker alive behind module-level distributed/parallel state that a dropped
+        reference does not touch. A project with more than one vllm-engine model would
+        then fail on the *second* one -- either outright ("Free memory on device ... is
+        less than desired GPU memory utilization") or, when it just barely fits, as a
+        nondeterministic OOM later on depending on fragmentation.
+
+        This is the same teardown sequence vLLM's own test suite uses between models
+        (tests/conftest.py: `del self.model; cleanup_dist_env_and_memory()`), which is the
+        supported way to run several engines back to back in one process.
+        """
+        from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+
+        # Stops the worker itself; without it the model and KV cache stay referenced by
+        # the still-running engine core regardless of what the caller drops.
+        try:
+            self.llm.llm_engine.engine_core.shutdown()
+        except Exception as e:
+            print(f" !! vllm engine: engine_core.shutdown() failed ({e}); "
+                  f"continuing with distributed cleanup")
         del self.llm
+        cleanup_dist_env_and_memory()
         free_mem()
 
 
