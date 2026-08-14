@@ -111,11 +111,20 @@ class Exl3Backend:
                                 embed_bits += bits
                                 embed_numel += m.weights_numel()
                             elif m.key.endswith("lm_head"):
-                                # A tied checkpoint may carry no tensor of its own under this
-                                # key; the module then aliases the embedding's storage via
-                                # alt_key instead of adding bytes, so it's left uncounted here
-                                # and picked up by the tied-head fallback below instead
-                                if self.config.stc.has_tensor(m.key):
+                                # A tied model's head module may have loaded a genuinely
+                                # separate on-disk tensor -- this project's own EXL3
+                                # quantizer writes one for every tied model regardless,
+                                # see TODO.md #2 -- or fallen back to aliasing the
+                                # embedding's storage via alt_key. `used_alt_key`, set by
+                                # Linear.load() itself, is the ground truth for which
+                                # happened. It is not equivalent to checking whether a bare
+                                # "lm_head" key exists in storage: this codebase's
+                                # checkpoints only ever store suffixed keys
+                                # ("lm_head.trellis", "lm_head.weight", ...), so a bare-key
+                                # check is always false, silently dead code -- every model,
+                                # tied or not, fell through to the embed-bpw fallback below
+                                # regardless of what actually got loaded onto the device.
+                                if not getattr(m, "used_alt_key", False):
                                     head_bits += bits
                                     head_numel += m.weights_numel()
                             else:
