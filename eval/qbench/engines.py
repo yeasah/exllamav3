@@ -1183,7 +1183,7 @@ def _quant_bits(config: dict) -> int | None:
     return int(bits) if isinstance(bits, (int, float)) and 1 <= bits <= 16 else None
 
 
-def safetensors_storage_info(source: str) -> dict:
+def safetensors_storage_info(source: str, tied_embed_from_head: bool = False) -> dict:
     """bpw/vram accounting straight off an HF-repo checkpoint's own stored bytes, for any
     vLLM-loadable safetensors model: plain bf16/fp16, compressed-tensors (AWQ/GPTQ/FP8/
     NVFP4), or EXL3 via this project's plugin. Same convention as gguf_storage_info:
@@ -1243,8 +1243,14 @@ def safetensors_storage_info(source: str) -> dict:
             continue
         is_embed = module_key.endswith("embed_tokens") or module_key.endswith(".wte")
         is_head = module_key.endswith("lm_head") or module_key.split(".")[-1] == "output"
-        if is_head and tied:
+        if is_head and tied and not tied_embed_from_head:
             continue  # never separately allocated; falls back to the embed bucket below
+        if is_embed and tied_embed_from_head:
+            # vllm-exl3-plugin serves the embedding out of the quantized lm_head
+            # for tied models, so the dense embed_tokens is never read off disk.
+            # Counting it here would report storage that never reaches VRAM --
+            # the exact saving this path exists to produce.
+            continue
 
         if trellis_shape is not None:
             numel = trellis_shape[0] * TILE * trellis_shape[1] * TILE
@@ -1285,6 +1291,11 @@ def safetensors_storage_info(source: str) -> dict:
             sum_bits += bits
             sum_numel += numel
 
+    if tied_embed_from_head:
+        # One tensor does both jobs: counted once in vram_gb (as the head), and
+        # reported as the bitrate of both, since it is literally the embedding.
+        embed_bits, embed_numel = head_bits, head_numel
+        head_is_fallback = True
     return {
         "bpw_layer": sum_bits / max(sum_numel, 1),
         "bpw_head": head_bits / max(head_numel, 1),
@@ -1316,22 +1327,52 @@ class VllmBackend:
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         _install_vllm_prompt_logprob_hook()
 
-        self.info = safetensors_storage_info(source)
         self.device = device
 
         from vllm import LLM
         llm_kwargs = dict(options)
+        # Environment variables applied only while this engine is built. vLLM and
+        # its plugins read a lot of behavior out of the environment at construction
+        # time, and a project comparing two settings of one of those needs them to
+        # differ per model entry rather than per process -- otherwise the two runs
+        # cannot share a reference pass, which is the whole point of running them
+        # in one project. Restored afterwards so entries stay independent.
+        env = llm_kwargs.pop("env", None) or {}
+        saved = {k: os.environ.get(k) for k in env}
+        os.environ.update({k: str(v) for k, v in env.items()})
+
+        # vllm-exl3-plugin serves a tied model's embedding out of the quantized
+        # lm_head, leaving the dense embed_tokens on disk. Storage accounting is
+        # read off the checkpoint, which cannot see that, so it has to be told --
+        # otherwise vram_gb reports bytes that never reach the GPU, understating
+        # exactly the saving being measured.
+        config = _read_config(source)
+        tied_embed = (
+            _tie_word_embeddings(config)
+            and (config.get("quantization_config") or {}).get("quant_method") == "exl3"
+            and str(env.get("VLLM_EXL3_DENSE_EMBED", "0")) != "1"
+            and any(k.startswith("lm_head.") for k in _safetensors_headers(source))
+        )
+        self.info = safetensors_storage_info(source, tied_embed_from_head=tied_embed)
+
         llm_kwargs.setdefault("gpu_memory_utilization", 0.85)
         llm_kwargs.setdefault("enforce_eager", True)
         llm_kwargs.setdefault("max_num_seqs", 1)
-        self.llm = LLM(
-            model=source,
-            max_model_len=max_len,
-            logprobs_mode="raw_logits",
-            max_logprobs=-1,
-            disable_log_stats=True,
-            **llm_kwargs,
-        )
+        try:
+            self.llm = LLM(
+                model=source,
+                max_model_len=max_len,
+                logprobs_mode="raw_logits",
+                max_logprobs=-1,
+                disable_log_stats=True,
+                **llm_kwargs,
+            )
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
         self.vocab_size = self.llm.llm_engine.model_config.get_vocab_size()
 
     def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
