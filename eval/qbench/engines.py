@@ -1350,7 +1350,7 @@ class VllmBackend:
         tied_embed = (
             _tie_word_embeddings(config)
             and (config.get("quantization_config") or {}).get("quant_method") == "exl3"
-            and str(env.get("VLLM_EXL3_DENSE_EMBED", "0")) != "1"
+            and str(env.get("EXL3_DENSE_EMBED", env.get("VLLM_EXL3_DENSE_EMBED", "0"))) != "1"
             and any(k.startswith("lm_head.") for k in _safetensors_headers(source))
         )
         self.info = safetensors_storage_info(source, tied_embed_from_head=tied_embed)
