@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import huggingface_hub
 
 import torch
 from datasets import load_dataset
@@ -69,19 +70,23 @@ def load_tensor(filename: str, key: str) -> torch.Tensor:
     with safe_open(filename, framework = "pt", device = "cpu") as f:
         return f.get_tensor(key)
 
-
+def resolve_hf(info: dict):
+    if "file" in info:
+        return huggingface_hub.hf_hub_download(repo_id=info["repo"], filename=info["file"], revision=info.get("revision"))
+    return huggingface_hub.snapshot_download(repo_id=info["repo"], revision=info.get("revision"))
+    
 def resolve_project_paths(project: dict, project_file: str):
     """Resolve relative paths in the project spec against the project file's directory"""
     base = os.path.dirname(os.path.abspath(project_file))
     def resolve(p):
         return p if os.path.isabs(p) else os.path.normpath(os.path.join(base, p))
     if project.get("tokenizer"):
-        project["tokenizer"]["source"] = resolve(project["tokenizer"]["source"])
+        project["tokenizer"]["source"] = resolve_hf(project["tokenizer"]) if "repo" in project["tokenizer"] else resolve(project["tokenizer"]["source"])
     if project.get("test_trace"):
         project["test_trace"] = resolve(project["test_trace"])
     project["logit_cache"]["dir"] = resolve(project["logit_cache"]["dir"])
     for m in project["models"]:
-        m["source"] = resolve(m["source"])
+        m["source"] = resolve_hf(m) if "repo" in m else resolve(m["source"])
     output = project.get("output", {})
     for key in ("plot_ppl", "plot_kld", "plot_ppl_vram", "plot_kld_vram", "plot_kld_spread",
                 "plot_kld_spread_vram", "plot_kld_hist", "plot_kld_hist_combined",
