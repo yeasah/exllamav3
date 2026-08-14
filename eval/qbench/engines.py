@@ -924,41 +924,67 @@ class LlamaCppBackend:
 # ------ vLLM engine ------------------------------------------------------------------
 #
 # vLLM's public prompt_logprobs API is built for a UI's top-k display, not a dense
-# [tokens, vocab] dump: asking for the full vocabulary (prompt_logprobs=-1) still makes
-# every downstream consumer build one Python object per (position, vocab entry) --
-# hundreds of millions of them for one 2048-token row -- which is unusable at qbench's
-# scale. The raw tensor exists for exactly one step before that happens, common to every
-# model runner variant: vllm.v1.engine.logprobs.LogprobsProcessor._update_prompt_logprobs
-# is the single place EngineCoreOutput.new_prompt_logprobs_tensors gets pythonized.
-# Hooking it and handing the original a width-1 stand-in keeps the rest of vLLM's output
-# pipeline doing O(1) work per position, while this keeps the real tensor.
+# [tokens, vocab] dump, and asking it for the full vocabulary (prompt_logprobs=-1) is
+# expensive in a way that isn't just "a lot of Python objects":
 #
-# Two load-bearing pieces this depends on, worth knowing if a vLLM bump breaks it:
-#  - VLLM_ENABLE_V1_MULTIPROCESSING=0 keeps EngineCore in this process, or the patched
-#    class is never the one the actual serving code touches (it lives in a subprocess by
-#    default).
-#  - logprobs_mode="raw_logits" (engine-level, ModelConfig) skips softmax and any
-#    temperature/top-p processing entirely, so what's captured is the model's literal
-#    pre-softmax output -- matching every other backend's convention here. A full-vocab
-#    request is still internally top-k sorted (torch.topk over the whole vocab), so the
-#    recovered tensor needs one scatter by token id to land back in natural vocab order.
+#   >>> torch.topk(torch.randn(1024, 151936, device="cuda"), 151936, dim=-1)
+#   peaks at ~7 GiB, transient, on top of the weights and KV cache -- vLLM's own
+#   compute_topk_scores does exactly this per 1024-token chunk of scored prompt whenever
+#   num_logprobs asks for (close to) the whole vocabulary, because k close to n makes
+#   torch.topk fall back to something close to a full sort, workspace and all. That spike
+#   happens *after* vLLM's memory profiler already decided how much of the GPU to give the
+#   KV cache (the profiler's own warmup pass never asks for full-vocab logprobs), so it's
+#   invisible to --gpu-memory-utilization and friends and shows up as an OOM inside
+#   torch.topk that no amount of turning those knobs down reliably fixes -- only handing
+#   KV cache *less* room works, and only by accident, by leaving more headroom for a spike
+#   the profiler never saw coming.
+#
+# So this doesn't ask vLLM to do that sort at all. compute_topk_scores's *input* --
+# `logits`, the [chunk, vocab] raw tensor computed once regardless of what width was
+# requested -- is exactly what this needs, before the expensive part. Patching it to grab
+# that argument and requesting prompt_logprobs=1 (not -1) means the real torch.topk vLLM
+# still runs is a cheap top-1, and the tensor this wants was already sitting right there.
+#
+# Getting the per-request boundaries right without redoing vLLM's own request-splitting
+# arithmetic (query_start_loc bookkeeping, chunked-prefill continuation, ...) is what
+# max_num_seqs=1 buys: with only ever one request's prompt being scored at a time, every
+# compute_topk_scores call in between "this row's prompt logprobs started" and "this row's
+# prompt logprobs finished" belongs to that row, in position order, full stop. Slower than
+# letting vLLM interleave requests for throughput, which is not a thing an eval harness
+# needs from it.
 #
 # The other half of the row (the position after the last prompt token) never goes through
 # prompt_logprobs at all -- vLLM only scores it if something asks it to generate, which is
-# exactly what max_tokens=1 is for. Its full-vocab distribution comes back through the
-# ordinary sample-logprobs path instead. That path is left functionally untouched (one
-# Python dict per row is cheap -- it happens once per row, not once per position, unlike
-# the prompt side) but is still observed, so this row's callback can fire the moment both
-# halves exist, rather than after the whole batch's generate() call returns. Doing the
-# handoff eagerly is what keeps this backend from holding every row's full-vocab tensor in
-# memory at once: at qbench's usual scale (10 rows, 2048 tokens, a 150-256k vocab) that's
-# tens of GB, not something to leave sitting around as a side effect of API convenience.
+# what max_tokens=1 is for. Its full-vocab distribution comes back through the ordinary
+# sample-logprobs path instead, at the *requested* logprobs=-1: compute_topk_scores there
+# always runs on a single row (one generated token), where the same full-width torch.topk
+# costs ~0.6 GiB, not ~7 -- the row count is what made the prompt side expensive, not the
+# vocab width by itself, so this path is left alone.
 #
-# EngineCoreOutput.update_from_output calls _update_sample_logprobs before
-# _update_prompt_logprobs (sample first, prompt second) -- the reverse of what the names'
-# reading order suggests. Rather than depend on that, whichever hook sees its half of a row
-# arrive first stashes it and the other one finalizes, so this doesn't silently break again
-# if a future vLLM reorders those two calls.
+# Both hooks fire per row, not after the whole batch's generate() call returns, so this
+# backend never holds more than one row's full-vocab tensor in memory at once -- at
+# qbench's usual scale (10 rows, 2048 tokens, a 150-256k vocab) the alternative is tens of
+# GB. EngineCoreOutput.update_from_output calls _update_sample_logprobs before
+# _update_prompt_logprobs (the reverse of what the names' reading order suggests); rather
+# than depend on that, whichever hook sees its half of a row arrive first stashes it and
+# the other one finalizes.
+#
+# Three load-bearing pieces this depends on, worth knowing if a vLLM bump breaks it:
+#  - VLLM_ENABLE_V1_MULTIPROCESSING=0 keeps EngineCore in this process, or none of the
+#    patched code is ever the code the actual serving path runs (it lives in a subprocess
+#    by default).
+#  - logprobs_mode="raw_logits" (engine-level, ModelConfig) skips softmax and any
+#    temperature/top-p processing, so what's captured is the model's literal pre-softmax
+#    output -- matching every other backend's convention here.
+#  - compute_topk_scores is patched as bound in vllm.v1.worker.gpu.sample.prompt_logprob
+#    (where compute_prompt_logprobs_with_chunking looks it up via its own `from ... import`
+#    binding), not in vllm.v1.worker.gpu.sample.logprob where it's defined -- that's what
+#    keeps this from also intercepting (and truncating) the sample-logprobs path, which
+#    imports the same function from its original module and must keep working at full
+#    width. This is the V2 GPU model runner's code path specifically (the one actually
+#    active in every environment this was built and tested against); the classic runner
+#    (gpu_model_runner.py, use_v2_model_runner=False) computes prompt logprobs through
+#    different code this does not patch, and would need the same fix applied there too.
 
 _VLLM_HOOK_INSTALLED = False
 
@@ -968,11 +994,12 @@ def _install_vllm_prompt_logprob_hook():
     if _VLLM_HOOK_INSTALLED:
         return
     import vllm.v1.engine.logprobs as lp_mod
-    from vllm.v1.outputs import LogprobsTensors
+    import vllm.v1.worker.gpu.sample.prompt_logprob as plp_mod
 
     orig_from_new_request = lp_mod.LogprobsProcessor.from_new_request.__func__
     orig_update_prompt = lp_mod.LogprobsProcessor._update_prompt_logprobs
     orig_update_sample = lp_mod.LogprobsProcessor._update_sample_logprobs
+    orig_topk_scores = plp_mod.compute_topk_scores
 
     def patched_from_new_request(cls, tokenizer, request):
         proc = orig_from_new_request(cls, tokenizer, request)
@@ -981,14 +1008,22 @@ def _install_vllm_prompt_logprob_hook():
         proc._qbench_req_id = request.request_id.split("-")[0]
         return proc
 
+    def patched_topk_scores(logits, num_logprobs, *args, **kwargs):
+        # Grab the real tensor before vLLM's own (now cheap, width=1) reduction of it.
+        # No row is currently "in progress" the first time this fires for a given row (see
+        # module docstring: max_num_seqs=1 makes this ordering safe), so plain appending is
+        # enough -- nothing else can interleave chunks from a different request in between.
+        if _VLLM_RUN_CTX.get("rows"):
+            _VLLM_RAW_CHUNKS.append(logits.detach().to(device="cpu", dtype=torch.float32))
+        return orig_topk_scores(logits, num_logprobs, *args, **kwargs)
+
     def patched_update_prompt(self, prompt_logprobs_tensors):
-        token_ids, logprobs, ranks, _ = prompt_logprobs_tensors
         rid = getattr(self, "_qbench_req_id", None)
         rows = _VLLM_RUN_CTX.get("rows")
         if rows is not None and rid in rows:
-            dense = torch.full((token_ids.shape[0], _VLLM_RUN_CTX["vocab"]), float("-inf"))
-            dense.scatter_(-1, token_ids.to(torch.int64).clamp_max(_VLLM_RUN_CTX["vocab"] - 1),
-                            logprobs.float())
+            dense = torch.cat(_VLLM_RAW_CHUNKS, dim=0) if _VLLM_RAW_CHUNKS else \
+                torch.zeros((0, _VLLM_RUN_CTX["vocab"]))
+            _VLLM_RAW_CHUNKS.clear()
             # update_from_output runs _update_sample_logprobs before this method, so the
             # last-row piece (below) is typically already waiting -- finalize and fire the
             # callback here rather than there.
@@ -996,12 +1031,7 @@ def _install_vllm_prompt_logprob_hook():
                 _finish_row(rid, dense, _VLLM_SAMPLE_PARTS.pop(rid))
             else:
                 _VLLM_PROMPT_PARTS[rid] = dense
-        truncated = LogprobsTensors(
-            logprob_token_ids=token_ids[:, :1],
-            logprobs=logprobs[:, :1],
-            selected_token_ranks=ranks,
-        )
-        return orig_update_prompt(self, truncated)
+        return orig_update_prompt(self, prompt_logprobs_tensors)
 
     def patched_update_sample(self, logprobs_lists):
         result = orig_update_sample(self, logprobs_lists)
@@ -1032,15 +1062,18 @@ def _install_vllm_prompt_logprob_hook():
     lp_mod.LogprobsProcessor.from_new_request = classmethod(patched_from_new_request)
     lp_mod.LogprobsProcessor._update_prompt_logprobs = patched_update_prompt
     lp_mod.LogprobsProcessor._update_sample_logprobs = patched_update_sample
+    plp_mod.compute_topk_scores = patched_topk_scores
     _VLLM_HOOK_INSTALLED = True
 
 
 # State for whichever VllmBackend.run() call is currently in flight. Module-level because
-# the patched methods above are bound to vLLM's own class, not to any VllmBackend instance;
-# only one run() is ever active at a time (qbench runs engines sequentially), so this is a
-# single slot rather than something keyed by backend instance.
+# the patched methods above are bound to vLLM's own class/module, not to any VllmBackend
+# instance; only one run() is ever active at a time (qbench runs engines sequentially, and
+# within a run, max_num_seqs=1 keeps rows from interleaving), so this is a single slot
+# rather than something keyed by backend instance.
 _VLLM_RUN_CTX: dict = {}          # {"rows": {req_id: row_idx}, "vocab", "length", "device", "callback"}
-_VLLM_PROMPT_PARTS: dict = {}     # req_id -> this row's [length-1, vocab] dense tensor, so far
+_VLLM_RAW_CHUNKS: list = []       # raw [chunk, vocab] tensors for whichever row is currently scoring
+_VLLM_PROMPT_PARTS: dict = {}     # req_id -> this row's assembled [length-1, vocab] tensor, once done
 _VLLM_SAMPLE_PARTS: dict = {}     # req_id -> the [1, vocab] last-row piece, whichever hook sees it first
 
 
@@ -1104,6 +1137,19 @@ def _read_small_int_tensor(path: str, offset: int, nbytes: int, dtype: str) -> l
         return list(struct.unpack(f"<{n}{fmt[-1]}", f.read(nbytes)))
 
 
+def _tie_word_embeddings(source: str) -> bool:
+    """config.json's tie_word_embeddings, checked under text_config too for multimodal
+    wrappers (mirrors TransformersBackend's own text_config-or-config fallback)."""
+    import json
+    try:
+        with open(os.path.join(source, "config.json")) as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    text_config = config.get("text_config") or config
+    return bool(text_config.get("tie_word_embeddings", config.get("tie_word_embeddings", False)))
+
+
 def safetensors_storage_info(source: str) -> dict:
     """bpw/vram accounting straight off an HF-repo checkpoint's own stored bytes, for any
     vLLM-loadable safetensors model: plain bf16/fp16, compressed-tensors (AWQ/GPTQ/FP8/
@@ -1111,11 +1157,20 @@ def safetensors_storage_info(source: str) -> dict:
     norms/biases excluded, router gates excluded by name, token embeddings tallied
     separately and used as the head's fallback for tied models.
 
+    A tied model's on-disk lm_head tensor, if any, is never counted as separate storage,
+    regardless of what the checkpoint physically contains: vLLM ties lm_head to the
+    embedding and skips loading every lm_head.* weight outright (see this project's own
+    EXL3Config.head_is_quantized), and this project's own EXL3 quantizer is known to write
+    a full redundant lm_head anyway for every tied model it quantizes (TODO.md #2) -- bytes
+    that are on disk but never make it into VRAM. Trusting the on-disk tensor here would
+    silently overcount vram_gb by exactly that redundant head's size.
+
     A tensor whose suffix isn't recognized is bucketed under its own full name and
     treated as ndim < 2 (i.e. dropped), so an unknown format undercounts rather than
     crashing or silently merging into the wrong bucket. Precise for what this project
     actually compares today; extend _CT_SUFFIXES/_EXL3_SUFFIXES for a new one.
     """
+    tied = _tie_word_embeddings(source)
     headers = _safetensors_headers(source)
     TILE = 16  # EXL3 trellis is tile-granular on both dims (vllm_exl3_plugin/format.py)
 
@@ -1150,6 +1205,8 @@ def safetensors_storage_info(source: str) -> dict:
             continue
         is_embed = module_key.endswith("embed_tokens") or module_key.endswith(".wte")
         is_head = module_key.endswith("lm_head") or module_key.split(".")[-1] == "output"
+        if is_head and tied:
+            continue  # never separately allocated; falls back to the embed bucket below
 
         if trellis_shape is not None:
             numel = trellis_shape[0] * TILE * trellis_shape[1] * TILE
@@ -1193,7 +1250,10 @@ class VllmBackend:
     served code path rather than a proxy for it.
 
     options: anything accepted by vllm.LLM (quantization, gpu_memory_utilization,
-    enforce_eager, tensor_parallel_size, dtype, ...) is passed straight through.
+    enforce_eager, tensor_parallel_size, dtype, ...) is passed straight through, including
+    max_num_seqs if a project genuinely wants concurrency back at the cost of the memory
+    behavior described in the module docstring above -- default is 1 (rows scored strictly
+    one at a time), which is what makes the prompt-logprobs capture correct and cheap.
 
     Noise injection (the self-noise-floor pass) is not implemented: unlike
     TransformersBackend's forward-hook approach, vLLM's decoder layers aren't at a
@@ -1213,6 +1273,7 @@ class VllmBackend:
         llm_kwargs = dict(options)
         llm_kwargs.setdefault("gpu_memory_utilization", 0.85)
         llm_kwargs.setdefault("enforce_eager", True)
+        llm_kwargs.setdefault("max_num_seqs", 1)
         self.llm = LLM(
             model=source,
             max_model_len=max_len,
@@ -1246,7 +1307,10 @@ class VllmBackend:
         _VLLM_PROMPT_PARTS.clear()
         _VLLM_SAMPLE_PARTS.clear()
 
-        sp = SamplingParams(max_tokens=1, temperature=0.0, logprobs=-1, prompt_logprobs=-1,
+        # prompt_logprobs=1, not -1: the module docstring above explains why asking for the
+        # full vocabulary here would be actively harmful rather than just slow. logprobs=-1
+        # (the *sample* side, one row at a time regardless) is the one that stays at -1.
+        sp = SamplingParams(max_tokens=1, temperature=0.0, logprobs=-1, prompt_logprobs=1,
                              detokenize=False)
         try:
             with pb:
