@@ -70,6 +70,45 @@ class Exl3Backend:
         # storage format: {"bits": int, "granularity": "per_row"|"per_tensor"} or None to leave
         # the checkpoint's real (always fp16) embedding untouched
         self.embed_quant = options.get("embed_quant")
+        # Same idea for the output head, and the reason it is worth asking separately:
+        # a tied model could serve the head and the embedding from ONE tensor only if
+        # whatever encoding the embedding wants is also good enough for logits. The head
+        # is the case EXL3's trellis was actually designed for, so this cannot be
+        # inferred from the embedding sweep. Replaces the checkpoint's quantized head
+        # with the (tied) fp16 embedding matrix put through the same fake quantizer;
+        # bits: 16 leaves it unquantized, which isolates the trellis head's own cost.
+        self.head_quant = options.get("head_quant")
+
+    def _fake_quant_head(self, module):
+        """Swap a quantized lm_head for a fake-quantized dense one built from the tied
+        embedding, i.e. from the same original matrix the head was quantized from."""
+        from exllamav3.modules.quant.fp16 import LinearFP16
+
+        stc = self.config.stc
+        key = next(
+            (k for k in stc.tensor_file_map if k.endswith("embed_tokens.weight")), None
+        )
+        if key is None:
+            raise RuntimeError("head_quant needs a tied model: no embed_tokens.weight")
+        w = stc.get_tensor(key, self.device, no_defer = True).half()    # [vocab, hidden]
+        bits = self.head_quant["bits"]
+        if bits < 16:
+            # Row-chunked: a vocabulary-sized matrix in fp32 is ~4 GiB per temporary,
+            # and fake_quantize makes several, which OOMs at 262144 x 3840.
+            gran = self.head_quant.get("granularity", "per_row")
+            for a in range(0, w.shape[0], 16384):
+                w[a : a + 16384] = fake_quantize(
+                    w[a : a + 16384].float(), bits, gran
+                ).half()
+        # LinearFP16 wants [in, out]; the checkpoint stores [out, in].
+        w = w.t().contiguous()
+        module.inner = LinearFP16(
+            module.in_features, module.out_features, w, None,
+            module.full_in_features, module.full_out_features,
+            module.first_in_feature, module.first_out_feature,
+            out_dtype = module.out_dtype, key = module.key,
+        )
+        module.quant_type = "fp16"
 
     def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
         from exllamav3.modules import Embedding, Linear
@@ -91,6 +130,10 @@ class Exl3Backend:
                         self.embed_quant["bits"],
                         self.embed_quant.get("granularity", "per_row"),
                     )
+
+                if self.head_quant and isinstance(module, Linear) \
+                        and module.key.endswith("lm_head"):
+                    self._fake_quant_head(module)
 
                 # Storage info while the module is resident. Biases are excluded from the
                 # convention; the MoE routing gate is not a Linear in exllamav3 and is thus
