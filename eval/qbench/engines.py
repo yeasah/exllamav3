@@ -53,6 +53,25 @@ def fake_quantize(x: torch.Tensor, bits: int, granularity: str = "per_row") -> t
     elif granularity == "per_tensor":
         lo = xf.amin()
         hi = xf.amax()
+    elif granularity.startswith("blockq:"):
+        # The layout this project would actually implement: per-block (min, scale) like
+        # block:N, but the two scalar arrays are themselves quantized to int8 against one
+        # fp16 range per row -- so the overhead is 16 bits per block (0.5 bpw at N=32)
+        # instead of 32, matching a k-quant's, while everything stays byte-aligned. No
+        # superblock, and no 6-bit scale packing to unpack on the serving path, which is
+        # the fiddliest part of Q4_K. bpw = bits + 16/N + 64/hidden
+        n = int(granularity.split(":", 1)[1])
+        assert xf.shape[-1] % n == 0
+        v = xf.reshape(*xf.shape[:-1], xf.shape[-1] // n, n)
+        lo = v.amin(dim = -1)
+        sc = (v.amax(dim = -1) - lo).clamp_min(1e-12) / levels
+        def q_row(t):                                   # int8 against one fp16 pair per row
+            tlo = t.amin(dim = -1, keepdim = True)
+            st = (t.amax(dim = -1, keepdim = True) - tlo).clamp_min(1e-12) / 255
+            return ((t - tlo) / st).round().clamp(0, 255) * st + tlo
+        sc, lo = q_row(sc), q_row(lo)
+        q = ((v - lo.unsqueeze(-1)) / sc.unsqueeze(-1).clamp_min(1e-12)).round().clamp(0, levels)
+        return (q * sc.unsqueeze(-1) + lo.unsqueeze(-1)).reshape(xf.shape).to(x.dtype)
     elif granularity.startswith("kshape:"):
         # GGUF's k-quant *structure* with the most naive possible encoder: superblocks of 256
         # split into sub-blocks of N, a (min, scale) per sub-block taken from min/max, and
