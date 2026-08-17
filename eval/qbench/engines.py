@@ -40,7 +40,11 @@ def fake_quantize(x: torch.Tensor, bits: int, granularity: str = "per_row") -> t
     changes - lets a sweep characterize sensitivity to a given precision level (is there a knee,
     where) without committing to a real packed format or a real kernel. "per_row" scales each row
     (e.g. one embedding vector) by its own min/max: the floor for quantization done reasonably,
-    not the pathological case a single tensor-wide scale would give."""
+    not the pathological case a single tensor-wide scale would give. "block:N" subdivides each
+    row into groups of N, which is what GGUF's k-quants do (their superblocks carry per-32
+    sub-scales); it costs a scale pair per block rather than per row, so its bpw is
+    bits + 32/N when the pair is stored fp16 - state that overhead explicitly when comparing,
+    since it is the whole difference between this and per_row."""
     levels = 2 ** bits - 1
     xf = x.float()
     if granularity == "per_row":
@@ -49,6 +53,37 @@ def fake_quantize(x: torch.Tensor, bits: int, granularity: str = "per_row") -> t
     elif granularity == "per_tensor":
         lo = xf.amin()
         hi = xf.amax()
+    elif granularity.startswith("kshape:"):
+        # GGUF's k-quant *structure* with the most naive possible encoder: superblocks of 256
+        # split into sub-blocks of N, a (min, scale) per sub-block taken from min/max, and
+        # those sub-scalars themselves quantized to 6 bits against one fp16 pair per
+        # superblock -- which is how Q4_K/Q5_K store their scales. No rounding search, no
+        # imatrix. Measured against a real k-quant at the same bpw, the difference is
+        # llama.cpp's encoder rather than its format, which is the thing worth knowing before
+        # taking on a dependency to get it. bpw = bits + 12/N + 0.125
+        sub = int(granularity.split(":", 1)[1])
+        superb = 256
+        assert xf.shape[-1] % superb == 0 and superb % sub == 0
+        slev = 2 ** 6 - 1
+        v = xf.reshape(*xf.shape[:-1], xf.shape[-1] // superb, superb // sub, sub)
+        lo = v.amin(dim = -1)
+        sc = (v.amax(dim = -1) - lo).clamp_min(1e-12) / levels
+        def q_super(t):
+            tlo = t.amin(dim = -1, keepdim = True)
+            st = (t.amax(dim = -1, keepdim = True) - tlo).clamp_min(1e-12) / slev
+            return ((t - tlo) / st).round().clamp(0, slev) * st + tlo
+        sc, lo = q_super(sc), q_super(lo)
+        q = ((v - lo.unsqueeze(-1)) / sc.unsqueeze(-1).clamp_min(1e-12)).round().clamp(0, levels)
+        return (q * sc.unsqueeze(-1) + lo.unsqueeze(-1)).reshape(xf.shape).to(x.dtype)
+    elif granularity.startswith("block:"):
+        n = int(granularity.split(":", 1)[1])
+        assert xf.shape[-1] % n == 0, f"row length {xf.shape[-1]} not divisible by block {n}"
+        v = xf.reshape(*xf.shape[:-1], xf.shape[-1] // n, n)
+        lo = v.amin(dim = -1, keepdim = True)
+        hi = v.amax(dim = -1, keepdim = True)
+        scale = (hi - lo).clamp_min(1e-12) / levels
+        q = ((v - lo) / scale).round().clamp(0, levels)
+        return (q * scale + lo).reshape(xf.shape).to(x.dtype)
     else:
         raise ValueError(f"Unknown granularity: {granularity}")
     scale = (hi - lo).clamp_min(1e-12) / levels
@@ -70,6 +105,12 @@ class Exl3Backend:
         # storage format: {"bits": int, "granularity": "per_row"|"per_tensor"} or None to leave
         # the checkpoint's real (always fp16) embedding untouched
         self.embed_quant = options.get("embed_quant")
+        # Substitute the embedding matrix wholesale from a safetensors file holding one
+        # [vocab, hidden] tensor (key "weight"), which is how a *real* encoder's output gets
+        # measured on the same footing as the simulated precision levels above: dequantize
+        # whatever produced it (e.g. a GGUF token_embd) offline, drop the result in here.
+        # Applied after embed_quant, so the two are mutually exclusive in practice.
+        self.embed_file = options.get("embed_file")
         # Same idea for the output head, and the reason it is worth asking separately:
         # a tied model could serve the head and the embedding from ONE tensor only if
         # whatever encoding the embedding wants is also good enough for logits. The head
@@ -130,6 +171,15 @@ class Exl3Backend:
                         self.embed_quant["bits"],
                         self.embed_quant.get("granularity", "per_row"),
                     )
+
+                if self.embed_file and isinstance(module, Embedding):
+                    from safetensors.torch import load_file
+                    w = load_file(self.embed_file)["weight"]
+                    cur = module.embedding.weight
+                    assert w.shape == cur.shape, \
+                        f"embed_file {list(w.shape)} != checkpoint embedding {list(cur.shape)}"
+                    cur.data = w.to(cur.device, cur.dtype)
+                    del w
 
                 if self.head_quant and isinstance(module, Linear) \
                         and module.key.endswith("lm_head"):
