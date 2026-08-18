@@ -38,14 +38,52 @@ class Embedding(Module):
             "prefer_cpu": True,
         })
 
+    #: Bytes this embedding actually occupies on disk, when it is stored in a packed
+    #: format that `load()` materializes. None when the checkpoint stores it dense.
+    stored_bytes = None
+
     @override
     def optimizer_targets(self):
         return []
 
+    def _load_blockq(self, device: torch.device):
+        """Materialize a block-scaled 4-bit embedding, or return None if absent.
+
+        Format reference: docs/blockq-format.md in vllm-exl3-plugin, which produces
+        these checkpoints (tools/quantize_embedding.py). Transcribed rather than
+        imported: this package must not depend on the plugin, and the decode is
+        fifteen lines of tensor arithmetic.
+
+        The served path never builds this matrix -- it gathers and decodes only the
+        rows a batch touches -- but the *values* are identical either way, so
+        materializing it here measures and calibrates against exactly what is served.
+        `stored_bytes` keeps the size accounting honest about that difference.
+        """
+        stc = self.config.stc
+        if not stc.has_tensor(self.key + ".bq_q"):
+            return None
+        # no_defer because this decodes *now*: under begin_deferred_load() a deferred
+        # tensor's contents arrive after load() returns, so arithmetic here would run on
+        # an unfilled buffer and produce a plausible-looking wrong matrix rather than an
+        # error. Every other module defers safely because none of them compute at load.
+        q8 = stc.get_tensor(self.key + ".bq_q", device, no_defer = True)
+        s8 = stc.get_tensor(self.key + ".bq_s", device, no_defer = True)
+        r = stc.get_tensor(self.key + ".bq_r", device, no_defer = True).float()
+        self.stored_bytes = sum(t.numel() * t.element_size() for t in (q8, s8, r))
+        rows, half = q8.shape
+        hidden, nblk = half * 2, s8.shape[-1]
+        block = hidden // nblk
+        q = torch.stack([q8 & 0x0F, q8 >> 4], dim = -1).view(rows, nblk, block).float()
+        scale = (s8[:, 0].float() * r[:, 1:2] + r[:, 0:1]).unsqueeze(-1)
+        minv = (s8[:, 1].float() * r[:, 3:4] + r[:, 2:3]).unsqueeze(-1)
+        return (q * scale + minv).view(rows, hidden).half()
+
     @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
-        weight = self.config.stc.get_tensor(self.key + ".weight", self.device, float2half = True, allow_bf16 = True)
+        weight = self._load_blockq(device)
+        if weight is None:
+            weight = self.config.stc.get_tensor(self.key + ".weight", self.device, float2half = True, allow_bf16 = True)
         self._numel = weight.numel()
         self.embedding = nn.Embedding(
             self.vocab_size,

@@ -220,7 +220,14 @@ class Exl3Backend:
                                 if not k.endswith(".bias")
                             )
                             if isinstance(m, Embedding):
-                                embed_bits += bits
+                                # A block-quantized embedding is materialized dense at
+                                # load (see Embedding._load_blockq), so its resident
+                                # tensor says 16 bpw while the checkpoint stores ~4.5.
+                                # The values are identical either way -- only the size
+                                # axis can be misled, and that axis is the whole reason
+                                # this accounting exists.
+                                stored = getattr(m, "stored_bytes", None)
+                                embed_bits += 8 * stored if stored else bits
                                 embed_numel += m.weights_numel()
                             elif m.key.endswith("lm_head"):
                                 # A tied model's head module may have loaded a genuinely
@@ -1250,7 +1257,13 @@ _VLLM_SAMPLE_PARTS: dict = {}     # req_id -> the [1, vocab] last-row piece, whi
 _CT_SUFFIXES = ("weight_packed", "weight_scale_inv", "weight_scale_2", "weight_scale",
                 "weight_zero_point", "weight_shape", "weight_g_idx", "weight_global_scale",
                 "input_global_scale", "input_scale", "scale")
-_EXL3_SUFFIXES = ("trellis", "suh", "svh", "mcg", "mul1", "su", "sv")
+_EXL3_SUFFIXES = ("trellis", "suh", "svh", "mcg", "mul1", "su", "sv",
+                  # Block-scaled embedding written by vllm-exl3-plugin's
+                  # tools/quantize_embedding.py (docs/blockq-format.md there). All three
+                  # must be listed: an unrecognized suffix buckets under its own full
+                  # name and is dropped, which for this format silently omits the whole
+                  # embedding from vram_gb rather than reporting it wrong.
+                  "bq_q", "bq_s", "bq_r")
 # Classic GPTQ/AWQ (autogptq, autoawq, auto-round, ...), which predate compressed-tensors
 # and name nothing the same way: an int-packed `qweight` plus `scales`/`qzeros`/`g_idx`
 # sidecars, and no `weight`/`weight_shape` anywhere. Distinct enough from _CT_SUFFIXES
@@ -1384,6 +1397,12 @@ def safetensors_storage_info(source: str, tied_embed_from_head: bool = False) ->
             m[1] = shape
         elif suffix == "weight":
             m[2] = shape
+        elif suffix == "bq_q":
+            # Packed 4-bit values, two per byte, so the logical matrix is twice as wide.
+            # Recorded as the plain weight shape because that is exactly what it is: the
+            # bits of all three tensors are already summed above, and the element count
+            # is the dense embedding's.
+            m[2] = [shape[0], shape[1] * 2]
         elif suffix == "weight_shape":
             # Not the tensor's own on-disk shape (that's just "[2]") -- its *contents* are
             # the true unpacked [out, in] compressed-tensors reports for a packed weight.
