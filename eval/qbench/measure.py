@@ -137,6 +137,10 @@ def print_stats(label: str, res: dict):
     if res.get("nonfinite_share"):
         line += f"   !! {100 * res['nonfinite_share']:.1f}% non-finite tokens excluded"
     print(line)
+    # Storage accounting has been silently wrong three times, always toward a plausible
+    # number, so say it out loud rather than leaving it to be noticed in a plot later.
+    if res.get("accounting_warning"):
+        print(f"      !! storage accounting: {res['accounting_warning']}")
     if "kld_buckets" in res:
         for b in res["kld_buckets"]:
             if b["mean"] is None:

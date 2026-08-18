@@ -116,6 +116,7 @@ class Exl3Backend:
     def __init__(self, source: str, max_len: int, device: torch.device, options: dict):
         from exllamav3 import Config, Model
         self.device = device
+        self.source = source
         self.config = Config.from_directory(source)
         self.config.override_dynamic_seq_len(max_len)
         self.model = Model.from_config(self.config)
@@ -276,12 +277,12 @@ class Exl3Backend:
             # Tied embeddings: the head is served by the embedding matrix, so its bytes must
             # not also be added under embed_bits below (same storage, not two allocations)
             head_bits, head_numel = embed_bits, embed_numel
-        self.info = {
+        self.info = check_against_disk({
             "bpw_layer": sum_bits / max(sum_numel, 1),
             "bpw_head": head_bits / max(head_numel, 1),
             "bpw_embed": embed_bits / max(embed_numel, 1),
             "vram_gb": (sum_bits + head_bits + (0 if tied_head else embed_bits)) / 8 / 1024 ** 3,
-        }
+        }, self.source, expect_share = 0.75)  # text modules only; towers excluded
 
     def close(self):
         self.model.unload()
@@ -1045,12 +1046,12 @@ def gguf_storage_info(source: str) -> dict:
                 sum_bits += t.n_bytes * 8
                 sum_numel += t.n_elements
         del reader
-    return {
+    return check_against_disk({
         "bpw_layer": sum_bits / max(sum_numel, 1),
         "bpw_head": head_bits / max(head_numel, 1),
         "bpw_embed": embed_bits / max(embed_numel, 1),
         "vram_gb": (sum_bits + head_bits + (0 if head_is_fallback else embed_bits)) / 8 / 1024 ** 3,
-    }
+    }, source)
 
 
 class LlamaCppBackend:
@@ -1351,6 +1352,61 @@ def _quant_bits(config: dict) -> int | None:
     return int(bits) if isinstance(bits, (int, float)) and 1 <= bits <= 16 else None
 
 
+def check_against_disk(info: dict, source: str, expect_share: float = 0.95) -> dict:
+    """Second opinion on storage accounting, from the one number that is never wrong.
+
+    Every bucket below is derived: a tensor is recognized by suffix, assigned to a
+    module, converted to a weight count. Each step can silently drop something -- an
+    unrecognized suffix buckets under its own name and vanishes, and the result is a
+    plausible number rather than an error. That has now happened three times (a dead
+    `bpw_head` fallback, unaccounted classic GPTQ/AWQ, and block-quantized embeddings
+    reporting `bpw_embed = 0.0` with a `vram_gb` missing the whole embedding).
+
+    The bytes on disk are not derived from anything. Comparing against them is the same
+    check a human does by hand -- look at the file sizes on the hub -- and it costs a
+    header scan.
+
+    How much *should* be accounted for depends on the caller, which is what
+    `expect_share` is for. A checkpoint-header scan counts everything on disk and should
+    land near 1.0 (only norms, biases and router gates are dropped). A streamed engine
+    walks the text model alone and legitimately omits whole vision towers, so it wants a
+    much looser bar. Either way this reports rather than asserts, and only shouts when a
+    bucket is impossible (zero) or the shortfall is too large for an exclusion to explain.
+
+    It guards under-counting, which is the failure that has actually happened. It says
+    nothing about over-counting -- whether a tensor that exists on disk is one the engine
+    will really load is a separate question, and a policy one (see the scope section of
+    docs/qbench.md).
+    """
+    try:
+        if os.path.isdir(source):
+            on_disk = sum(v[0] for v in _safetensors_headers(source).values())
+        else:
+            # A single .gguf, whose tensor data is the file minus a small header
+            on_disk = os.path.getsize(source)
+    except Exception:
+        return info
+    if not on_disk:
+        return info
+    counted = info.get("vram_gb", 0.0) * 1024 ** 3
+    share = counted / on_disk
+    info["accounted_share"] = share
+    info["unaccounted_gb"] = (on_disk - counted) / 1024 ** 3
+
+    problems = []
+    for bucket in ("bpw_layer", "bpw_embed"):
+        if info.get(bucket) == 0.0:
+            problems.append(f"{bucket} is 0.0, so that bucket matched no tensor at all")
+    if share < expect_share:
+        problems.append(
+            f"only {share:.0%} of the checkpoint's {on_disk / 1024 ** 3:.2f} GiB of tensor "
+            f"bytes were accounted for"
+        )
+    if problems:
+        info["accounting_warning"] = "; ".join(problems)
+    return info
+
+
 def safetensors_storage_info(source: str, tied_embed_from_head: bool = False) -> dict:
     """bpw/vram accounting straight off an HF-repo checkpoint's own stored bytes, for any
     vLLM-loadable safetensors model: plain bf16/fp16, compressed-tensors (AWQ/GPTQ/FP8/
@@ -1470,12 +1526,12 @@ def safetensors_storage_info(source: str, tied_embed_from_head: bool = False) ->
         # reported as the bitrate of both, since it is literally the embedding.
         embed_bits, embed_numel = head_bits, head_numel
         head_is_fallback = True
-    return {
+    return check_against_disk({
         "bpw_layer": sum_bits / max(sum_numel, 1),
         "bpw_head": head_bits / max(head_numel, 1),
         "bpw_embed": embed_bits / max(embed_numel, 1),
         "vram_gb": (sum_bits + head_bits + (0 if head_is_fallback else embed_bits)) / 8 / 1024 ** 3,
-    }
+    }, source)
 
 
 class VllmBackend:
