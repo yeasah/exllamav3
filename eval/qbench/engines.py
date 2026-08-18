@@ -212,9 +212,12 @@ class Exl3Backend:
                 # bucket rather than the layer bucket
                 if self.info is None:
                     stack = [module]
+                    counted_keys = getattr(self, "_counted_keys", None) or set()
+                    self._counted_keys = counted_keys
                     while stack:
                         m = stack.pop()
                         if isinstance(m, (Linear, Embedding)):
+                            counted_keys.add(m.key)
                             bits = 8 * sum(
                                 t.element_size() * t.numel()
                                 for k, t in m.get_tensors().items()
@@ -282,7 +285,7 @@ class Exl3Backend:
             "bpw_head": head_bits / max(head_numel, 1),
             "bpw_embed": embed_bits / max(embed_numel, 1),
             "vram_gb": (sum_bits + head_bits + (0 if tied_head else embed_bits)) / 8 / 1024 ** 3,
-        }, self.source, expect_share = 0.75)  # text modules only; towers excluded
+        }, self.source, getattr(self, "_counted_keys", None))
 
     def close(self):
         self.model.unload()
@@ -1352,56 +1355,78 @@ def _quant_bits(config: dict) -> int | None:
     return int(bits) if isinstance(bits, (int, float)) and 1 <= bits <= 16 else None
 
 
-def check_against_disk(info: dict, source: str, expect_share: float = 0.95) -> dict:
+#: On-disk tensors a storage tally is *expected* to leave out, by name. Multimodal
+#: towers and speculative-decoding heads are real bytes that no text-only accounting
+#: should count; norms, biases and router gates are excluded by rule everywhere.
+_EXPECTED_ABSENT = (
+    "vision", "visual", "mm_projector", "multi_modal", "audio_tower", "mtp",
+)
+
+
+def check_against_disk(info: dict, source: str, counted_keys=None) -> dict:
     """Second opinion on storage accounting, from the one number that is never wrong.
 
-    Every bucket below is derived: a tensor is recognized by suffix, assigned to a
-    module, converted to a weight count. Each step can silently drop something -- an
-    unrecognized suffix buckets under its own name and vanishes, and the result is a
-    plausible number rather than an error. That has now happened three times (a dead
-    `bpw_head` fallback, unaccounted classic GPTQ/AWQ, and block-quantized embeddings
-    reporting `bpw_embed = 0.0` with a `vram_gb` missing the whole embedding).
+    Every figure in `info` is derived: recognize a suffix, assign it to a module, convert
+    to a weight count. Each step can drop something silently and yield a plausible number
+    rather than an error -- which has now happened three times (a dead `bpw_head`
+    fallback, unaccounted classic GPTQ/AWQ, block-quantized embeddings reporting
+    `bpw_embed = 0.0`). The bytes on disk are derived from nothing, so comparing against
+    them is the check a human does by hand: go look at the file sizes.
 
-    The bytes on disk are not derived from anything. Comparing against them is the same
-    check a human does by hand -- look at the file sizes on the hub -- and it costs a
-    header scan.
+    **Deliberately not a ratio against a threshold.** A share is uncalibratable, because
+    the models with the most legitimately-absent bytes (a 50-layer vision tower, an MTP
+    head) are exactly the ones where a real gap has the most room to hide underneath the
+    slack -- and any threshold loose enough not to fire on them is loose enough to miss a
+    dropped embedding. So every on-disk tensor is classified instead: counted, expected to
+    be absent, or **unexplained**. Only the last matters, and it should be zero on any
+    checkpoint, however much apparatus the model carries.
 
-    How much *should* be accounted for depends on the caller, which is what
-    `expect_share` is for. A checkpoint-header scan counts everything on disk and should
-    land near 1.0 (only norms, biases and router gates are dropped). A streamed engine
-    walks the text model alone and legitimately omits whole vision towers, so it wants a
-    much looser bar. Either way this reports rather than asserts, and only shouts when a
-    bucket is impossible (zero) or the shortfall is too large for an exclusion to explain.
-
-    It guards under-counting, which is the failure that has actually happened. It says
-    nothing about over-counting -- whether a tensor that exists on disk is one the engine
-    will really load is a separate question, and a policy one (see the scope section of
-    docs/qbench.md).
+    `counted_keys` is the set of module keys the caller tallied; a tensor belongs to the
+    module its name starts with. Callers that cannot supply it get the byte totals and no
+    verdict, which is honest rather than reassuring.
     """
     try:
         if os.path.isdir(source):
-            on_disk = sum(v[0] for v in _safetensors_headers(source).values())
+            headers = _safetensors_headers(source)
         else:
-            # A single .gguf, whose tensor data is the file minus a small header
-            on_disk = os.path.getsize(source)
+            info["on_disk_gb"] = os.path.getsize(source) / 1024 ** 3
+            return info
     except Exception:
         return info
+    on_disk = sum(v[0] for v in headers.values())
     if not on_disk:
         return info
-    counted = info.get("vram_gb", 0.0) * 1024 ** 3
-    share = counted / on_disk
-    info["accounted_share"] = share
-    info["unaccounted_gb"] = (on_disk - counted) / 1024 ** 3
+    info["on_disk_gb"] = on_disk / 1024 ** 3
 
-    problems = []
-    for bucket in ("bpw_layer", "bpw_embed"):
-        if info.get(bucket) == 0.0:
-            problems.append(f"{bucket} is 0.0, so that bucket matched no tensor at all")
-    if share < expect_share:
-        problems.append(
-            f"only {share:.0%} of the checkpoint's {on_disk / 1024 ** 3:.2f} GiB of tensor "
-            f"bytes were accounted for"
-        )
+    problems = [f"{b} is 0.0, so that bucket matched no tensor at all"
+                for b in ("bpw_layer", "bpw_embed") if info.get(b) == 0.0]
+
+    if counted_keys is not None:
+        counted = absent = unexplained = 0
+        offenders: dict[str, int] = {}
+        for name, (nbytes, shape, *_rest) in headers.items():
+            key = name
+            for suf in _KNOWN_SUFFIXES:
+                if name.endswith("." + suf):
+                    key = name[: -(len(suf) + 1)]
+                    break
+            if key in counted_keys:
+                counted += nbytes
+            elif (any(k in name for k in _EXPECTED_ABSENT)
+                    or any(k in name for k in HF_ROUTER_KEYS)
+                    or name.endswith(".bias") or len(shape) < 2):
+                absent += nbytes
+            else:
+                unexplained += nbytes
+                offenders[key] = offenders.get(key, 0) + nbytes
+        info["unexplained_gb"] = unexplained / 1024 ** 3
+        info["expected_absent_gb"] = absent / 1024 ** 3
+        if unexplained:
+            worst = sorted(offenders.items(), key = lambda kv: -kv[1])[:3]
+            problems.append(
+                f"{unexplained / 1024 ** 3:.3f} GiB of on-disk tensors matched no bucket "
+                f"and no exclusion rule (e.g. {', '.join(k for k, _ in worst)})"
+            )
     if problems:
         info["accounting_warning"] = "; ".join(problems)
     return info
@@ -1468,18 +1493,23 @@ def safetensors_storage_info(source: str, tied_embed_from_head: bool = False) ->
 
     sum_bits = sum_numel = head_bits = head_numel = embed_bits = embed_numel = 0
     head_is_fallback = True
+    counted_keys: set = set()
     for module_key, (bits, trellis_shape, weight_shape, packed_shape, qweight) in modules.items():
         if any(k in module_key for k in HF_ROUTER_KEYS):
             continue
         is_embed = module_key.endswith("embed_tokens") or module_key.endswith(".wte")
         is_head = module_key.endswith("lm_head") or module_key.split(".")[-1] == "output"
         if is_head and tied and not tied_embed_from_head:
-            continue  # never separately allocated; falls back to the embed bucket below
+            # Never separately allocated (falls back to the embed bucket below), but the
+            # bytes are really on disk, so mark them explained rather than unexplained.
+            counted_keys.add(module_key)
+            continue
         if is_embed and tied_embed_from_head:
             # vllm-exl3-plugin serves the embedding out of the quantized lm_head
             # for tied models, so the dense embed_tokens is never read off disk.
             # Counting it here would report storage that never reaches VRAM --
             # the exact saving this path exists to produce.
+            counted_keys.add(module_key)
             continue
 
         if trellis_shape is not None:
@@ -1509,6 +1539,7 @@ def safetensors_storage_info(source: str, tied_embed_from_head: bool = False) ->
 
         if not numel:
             continue
+        counted_keys.add(module_key)
         if is_embed:
             embed_bits += bits
             embed_numel += numel
@@ -1531,7 +1562,7 @@ def safetensors_storage_info(source: str, tied_embed_from_head: bool = False) ->
         "bpw_head": head_bits / max(head_numel, 1),
         "bpw_embed": embed_bits / max(embed_numel, 1),
         "vram_gb": (sum_bits + head_bits + (0 if head_is_fallback else embed_bits)) / 8 / 1024 ** 3,
-    }, source)
+    }, source, counted_keys)
 
 
 class VllmBackend:
