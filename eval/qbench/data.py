@@ -3,6 +3,7 @@ Project spec handling, test data preparation and the central cache.
 """
 
 import hashlib
+import datetime
 import json
 import os
 import shutil
@@ -114,6 +115,38 @@ class QCache:
         self.root = os.path.join(spec["dir"], "qbench")
         self.max_size = int(spec.get("max_size_gb", 200) * 1024 ** 3)
         os.makedirs(self.root, exist_ok = True)
+
+    # Every cache entry is named by a hash of what produced it, which is what makes the
+    # cache correct -- change a model, a test set or an option and you get a different
+    # entry rather than a stale hit. It also makes the directory unnavigable by hand: a
+    # reference pass worth 11 GiB looks exactly like every other `logits_<hex>_<hex>`.
+    # So each write also records what the entry *is*, in one manifest at the cache root.
+    # Advisory only: nothing reads it to decide a cache hit, and deleting it loses no
+    # data, only the ability to say what a hash meant.
+    def manifest_file(self):
+        return os.path.join(self.root, "manifest.json")
+
+    def _manifest(self) -> dict:
+        try:
+            with open(self.manifest_file(), "r") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def note(self, key: str, info: dict):
+        """Record what a cache key stands for, merging into the existing entry."""
+        man = self._manifest()
+        entry = man.get(key, {})
+        entry.update({k: v for k, v in info.items() if v is not None})
+        entry["seen"] = datetime.datetime.now().isoformat(timespec = "seconds")
+        man[key] = entry
+        tmp = self.manifest_file() + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(man, f, indent = 1, sort_keys = True)
+        os.replace(tmp, self.manifest_file())
+
+    def describe(self, key: str) -> dict:
+        return self._manifest().get(key, {})
 
     def tokens_file(self, key):
         return os.path.join(self.root, f"tokens_{key}.safetensors")

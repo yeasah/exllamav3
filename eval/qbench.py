@@ -107,6 +107,24 @@ def main(args):
     ref_store = cache.logits_dir(f"{data_key}_{ref_key}")
     ref_meta = os.path.join(ref_store, "meta.json")
 
+    # Record what each key stands for, so the cache can be read by a human later. This is
+    # bookkeeping, not correctness: nothing below consults it.
+    def note(mspec, key, **extra):
+        cache.note(key, {
+            "project": os.path.basename(args.project),
+            "title": project.get("title"),
+            "label": mspec.get("label"),
+            "group": mspec.get("group"),
+            "engine": mspec.get("engine"),
+            "repo": mspec.get("repo"),
+            "revision": mspec.get("revision"),
+            "source": mspec.get("source"),
+            "options": mspec.get("options") or None,
+            **extra,
+        })
+
+    note(ref, f"{data_key}_{ref_key}", role = "reference logits")
+
     all_results = []
 
     # ------ Reference pass: cache logits + confidence, measure ppl
@@ -127,6 +145,7 @@ def main(args):
         ref_results = stats.results()
         ref_results.update(backend.info)
         cache.save_results(ref_results_key, ref_results)
+        note(ref, ref_results_key, role = "reference self-score")
         backend.close()
     print_stats(ref["label"], ref_results)
     all_results.append({"label": ref["label"], "group": ref["group"], **ref_results})
@@ -142,6 +161,7 @@ def main(args):
             floor_results = stats.results()
             floor_results.update(backend.info)
             cache.save_results(floor_results_key, floor_results)
+            note(ref, floor_results_key, role = "noise floor", label = "Noise floor")
             cache.save_kl(floor_results_key, stats.kl_vector())
             backend.close()
         print_stats("Noise floor", floor_results)
@@ -164,6 +184,7 @@ def main(args):
             res = stats.results()
             res.update(backend.info)
             cache.save_results(results_key, res)
+            note(mspec, results_key, role = "model score")
             cache.save_kl(results_key, stats.kl_vector())
             backend.close()
         print_stats(mspec["label"], res)
