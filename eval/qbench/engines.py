@@ -103,6 +103,40 @@ def fake_quantize(x: torch.Tensor, bits: int, granularity: str = "per_row") -> t
         scale = (hi - lo).clamp_min(1e-12) / levels
         q = ((v - lo) / scale).round().clamp(0, levels)
         return (q * scale + lo).reshape(xf.shape).to(x.dtype)
+    elif granularity.startswith("sym:") or granularity == "sym_row":
+        # compressed-tensors / llm-compressor's weight-only WNA16 scheme, which is what
+        # `QuantizationModifier(targets=["Embedding"], ...)` emits and what vLLM's
+        # CompressedTensorsEmbeddingWNA16Int serves. Symmetric: one scale per group, no
+        # min/zero-point, codes spanning [-2^(b-1), 2^(b-1)-1] against scale =
+        # max|v| / ((2^b - 1) / 2). Note the half-level asymmetry that falls out of that
+        # denominator -- the most positive value in a group rounds to 2^(b-1) and clips
+        # back to 2^(b-1)-1, i.e. it is reconstructed ~7% low at 4 bits, while the most
+        # negative one is exact. That is their format, not a transcription slip.
+        #
+        # "sym:N" is strategy=group with group_size=N (bpw = bits + 16/N); "sym_row" is
+        # strategy=channel (bpw = bits + 16/hidden). Unlike the affine arms above this
+        # one does NOT promote to fp32: compressed-tensors stores weight_scale in the
+        # model's own dtype (vLLM allocates it as params_dtype) and does the QDQ there,
+        # so promoting would measure a scheme nobody serves. Verified bit-identical to
+        # compressed_tensors' own calculate_qparams + fake_quantize at 4/5/8 bits, group
+        # and channel, in fp32 and bf16.
+        qmax = 2 ** (bits - 1) - 1
+        qmin = -(2 ** (bits - 1))
+        if granularity == "sym_row":
+            v = x.unsqueeze(-2)
+        else:
+            n = int(granularity.split(":", 1)[1])
+            assert x.shape[-1] % n == 0, f"row length {x.shape[-1]} not divisible by group {n}"
+            v = x.reshape(*x.shape[:-1], x.shape[-1] // n, n)
+        # 0.0 must be representable in the quantized range, so the observed min is clamped
+        # to <= 0 and the max to >= 0 before the magnitude is taken (compressed-tensors
+        # does this in calculate_qparams; it only bites on an all-positive group).
+        mn = v.amin(dim = -1).clamp(max = 0.0)
+        mx = v.amax(dim = -1).clamp(min = 0.0)
+        sc = torch.maximum(mn.abs(), mx.abs()) / (float(qmax - qmin) / 2.0)
+        sc = torch.where(sc == 0, torch.full_like(sc, torch.finfo(sc.dtype).eps), sc)
+        q = (v / sc.unsqueeze(-1)).round().clamp(qmin, qmax)
+        return (q * sc.unsqueeze(-1)).reshape(x.shape).to(x.dtype)
     else:
         raise ValueError(f"Unknown granularity: {granularity}")
     scale = (hi - lo).clamp_min(1e-12) / levels
