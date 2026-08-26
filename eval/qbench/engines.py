@@ -137,6 +137,40 @@ def fake_quantize(x: torch.Tensor, bits: int, granularity: str = "per_row") -> t
         sc = torch.where(sc == 0, torch.full_like(sc, torch.finfo(sc.dtype).eps), sc)
         q = (v / sc.unsqueeze(-1)).round().clamp(qmin, qmax)
         return (q * sc.unsqueeze(-1)).reshape(x.shape).to(x.dtype)
+    elif granularity in ("fp8_row", "fp8_tensor"):
+        # fp8-e4m3 with an fp16 scale, the shape AutoFP8 and compressed-tensors'
+        # float-quantized both store. `bits` is ignored -- the format is 8 bits by
+        # construction -- so bpw is 8 + 16/hidden per row, or 8 flat per tensor,
+        # byte-comparable to the symmetric int8 arms.
+        #
+        # It is here because fp8 fails *differently*, not better: an integer arm
+        # holds absolute error constant within its group (which is why per-row
+        # suits embeddings, where one outlier component spoils a row), while
+        # e4m3 holds roughly constant *relative* error and does not care about
+        # group max. Which suits a given role is empirical. Note the failure mode
+        # this scaling exists to avoid: cast unscaled, e4m3 flushes small values
+        # to zero and max relative error is 1.0.
+        E4M3_MAX = 448.0
+        # Chunked only to bound peak temporaries: a caller may hand this a whole
+        # [vocab, hidden] matrix, and the fp32 staging buffer would then scale
+        # with it for no reason. At 2048 rows the temporaries are ~30 MiB
+        # regardless of input size, which costs nothing measurable here.
+        out = torch.empty_like(x)
+        if granularity == "fp8_tensor":
+            gmax = torch.maximum(x.float().amax(), x.float().amin().neg())
+        step = 2048
+        for a in range(0, x.shape[0], step):
+            sl = x[a : a + step].float()
+            if granularity == "fp8_row":
+                amax = torch.maximum(sl.amax(dim=-1, keepdim=True),
+                                     sl.amin(dim=-1, keepdim=True).neg())
+            else:
+                amax = gmax
+            scale = (amax / E4M3_MAX).clamp_min(1e-12)
+            q = (sl / scale).clamp_(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+            out[a : a + step] = (q.to(torch.float32) * scale).to(x.dtype)
+            del sl, q
+        return out
     else:
         raise ValueError(f"Unknown granularity: {granularity}")
     scale = (hi - lo).clamp_min(1e-12) / levels
