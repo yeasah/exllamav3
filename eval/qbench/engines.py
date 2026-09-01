@@ -676,6 +676,20 @@ class TransformersBackend:
             "bpw_embed": embed_bits / max(embed_numel, 1),
             "vram_gb": (sum_bits + head_bits + (0 if tied_head else embed_bits)) / 8 / 1024 ** 3,
         }
+        if sum_numel == 0 and qcfg and os.path.isdir(source):
+            # The walk above sees nothing, so every quantized layer was invisible to
+            # named_parameters()/named_buffers(). That is not hypothetical: SINQ holds
+            # `W_q` as a plain tensor attribute and its scales in a plain dict, so a
+            # quantized model reports only its norms and embedding -- bpw_layer 0.0 and a
+            # vram_gb covering the embedding alone, with no error anywhere. Any tool that
+            # measures a model by walking parameters has the same blind spot.
+            #
+            # Fall back to the checkpoint, which is the better source regardless: it is
+            # what check_against_disk validates against, and it cannot be fooled by how a
+            # loader chooses to attach its tensors.
+            disk = safetensors_storage_info(source)
+            if disk.get("bpw_layer"):
+                self.info = disk
 
     def _decoder_layers(self):
         best = None
@@ -1341,7 +1355,17 @@ _EXL3_SUFFIXES = ("trellis", "suh", "svh", "mcg", "mul1", "su", "sv",
 # sidecars, and no `weight`/`weight_shape` anywhere. Distinct enough from _CT_SUFFIXES
 # that the two never collide ("scales" is not "scale", ".g_idx" is not ".weight_g_idx").
 _GPTQ_SUFFIXES = ("qweight", "qzeros", "scales", "g_idx")
-_KNOWN_SUFFIXES = _CT_SUFFIXES + _EXL3_SUFFIXES + _GPTQ_SUFFIXES + ("weight",)
+# SINQ (transformers' SinqConfig / the `sinq` package). `W_q` is int-packed exactly like
+# GPTQ/AWQ's `qweight` and shares its numel math, so it feeds the same slot below. The
+# sidecars are listed with their full dotted paths deliberately: SINQ quantizes its own
+# scales and zeros, and the leaf names of that second-order metadata are the single
+# letters `m`, `s` and `x`. Matching those bare would collide with anything in any format
+# whose name happens to end that way, so the qualifier is part of the suffix here.
+_SINQ_SUFFIXES = ("W_q", "meta.scale2",
+                  "meta.scale.m", "meta.scale.s", "meta.scale.x",
+                  "meta.zero.m", "meta.zero.s", "meta.zero.x")
+_KNOWN_SUFFIXES = (_CT_SUFFIXES + _EXL3_SUFFIXES + _GPTQ_SUFFIXES + _SINQ_SUFFIXES
+                   + ("weight",))
 
 #: Bits per stored element, for recovering an int-packed tensor's logical element count.
 _ST_DTYPE_BITS = {"I64": 64, "U64": 64, "I32": 32, "U32": 32, "I16": 16, "U16": 16,
@@ -1415,11 +1439,17 @@ def _quant_bits(config: dict) -> int | None:
     """Weight bit width from a GPTQ/AWQ-style quantization_config, which is the only place
     it is recorded -- unlike EXL3 (bit width recoverable from the trellis shape) or
     compressed-tensors (which ships an explicit weight_shape sidecar), an int-packed
-    `qweight` cannot be un-packed to a logical element count without knowing it."""
+    `qweight` cannot be un-packed to a logical element count without knowing it.
+
+    Every format spells the field differently and a miss here is silent (the size axis
+    comes back None), so the alias list is the whole content of this function: `bits`
+    (GPTQ/auto-round), `w_bit` (AWQ), `weight_bits`, `nbits` (SINQ)."""
     qc = config.get("quantization_config")
     if not isinstance(qc, dict):
         return None
-    bits = qc.get("bits") or qc.get("w_bit") or qc.get("weight_bits")
+    bits = (
+        qc.get("bits") or qc.get("w_bit") or qc.get("weight_bits") or qc.get("nbits")
+    )
     return int(bits) if isinstance(bits, (int, float)) and 1 <= bits <= 16 else None
 
 
@@ -1556,7 +1586,9 @@ def safetensors_storage_info(source: str, tied_embed_from_head: bool = False) ->
             # Not the tensor's own on-disk shape (that's just "[2]") -- its *contents* are
             # the true unpacked [out, in] compressed-tensors reports for a packed weight.
             m[3] = _read_small_int_tensor(path, offset, nbytes, dtype)
-        elif suffix == "qweight":
+        elif suffix in ("qweight", "W_q"):
+            # SINQ's W_q is the same thing under another name: logical weights bit-packed
+            # into a wider int, recovered by the packing factor rather than by shape.
             m[4] = (shape, dtype)
 
     sum_bits = sum_numel = head_bits = head_numel = embed_bits = embed_numel = 0
