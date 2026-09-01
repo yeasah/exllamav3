@@ -93,7 +93,8 @@ def main(args):
         # identical at matching batch shapes; the streamed pass batches all rows, so vs the
         # per-row non-streamed pass the difference is batch-size kernel numerics - the same
         # class of variation as a driver update, well below any model's self-noise floor
-        options = {k: v for k, v in mspec.get("options", {}).items() if k != "streaming"}
+        raw_options = mspec.get("options", {})
+        options = {k: v for k, v in raw_options.items() if k != "streaming"}
         return sha_key({
             "v": 1,
             "engine": mspec["engine"],
@@ -101,6 +102,15 @@ def main(args):
             "options": options,
             "stamp": source_stamp(mspec["source"]),
             "noise": BF16_ROUNDING_EPS if noise else 0,
+            # Scoped key version for quantize arms. The exclusion above was sound while
+            # `streaming` only chose how weights were fetched -- but once `quantize`
+            # existed, streaming was for a while the difference between a *quantized* and
+            # an *unquantized* model, and results scored that way (KLD ~0) were cached
+            # under a key that could not tell them apart. The combination is refused now,
+            # but entries written before that are still on disk and would be served to the
+            # arm that supersedes them. Bumping only for quantize arms retires exactly
+            # those and keeps every other cached result.
+            **({"quantize_keying": 2} if "quantize" in raw_options else {}),
         })
 
     ref_key = model_key(ref)
