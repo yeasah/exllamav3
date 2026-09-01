@@ -390,6 +390,19 @@ class TransformersBackend:
         # transformers integration. Both work through SINQ's own quantize_model(). It is
         # also simply cheaper for a sweep -- 1.5 s and no checkpoint per point.
         self.quantize_spec = options.get("quantize")
+        # Guard, not a nicety. `quantize` is applied on the non-streaming load path only;
+        # under `streaming` the option was silently ignored, so the arm scored the
+        # *unquantized* model against the unquantized reference and reported KLD ~0 --
+        # which reads as a column of zeroes rather than as an error, and is
+        # indistinguishable from a lossless quantizer. Fail instead.
+        if self.quantize_spec and self.streaming:
+            raise ValueError(
+                "options.quantize cannot be combined with options.streaming: the "
+                "streaming loader materializes weights per module from the shards and "
+                "returns them to meta, so there is no resident model to quantize and the "
+                "spec would be silently ignored (scoring the bf16 model, KLD ~0). Drop "
+                "streaming, or quantize to a checkpoint first and point `source` at it."
+            )
         self.shard_handles = {}
 
         if self.streaming:
@@ -726,7 +739,15 @@ class TransformersBackend:
 
         spec = dict(self.quantize_spec)
         spec.pop("backend", None)
+        # BaseQuantizeConfig's own default method is "dual", not "sinq" -- a different
+        # variant that keeps fp16 metadata and measures 4.51 bpw at nbits=4/group 64
+        # against "sinq"'s 4.28. Omitting `method` in a project file would silently mix
+        # two quantizers in one sweep, so default it to the named method instead and
+        # print what actually ran.
+        spec.setdefault("method", "sinq")
         cfg = BaseQuantizeConfig(**spec)
+        print(f" -- quantizing in process: "
+              + ", ".join(f"{k}={v}" for k, v in sorted(spec.items())))
         tok = AutoTokenizer.from_pretrained(source)
         AutoSINQHFModel.quantize_model(
             self.model, tokenizer = tok, quant_config = cfg,
