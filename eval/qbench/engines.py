@@ -390,22 +390,23 @@ class TransformersBackend:
         # transformers integration. Both work through SINQ's own quantize_model(). It is
         # also simply cheaper for a sweep -- 1.5 s and no checkpoint per point.
         self.quantize_spec = options.get("quantize")
-        # Guard, not a nicety. `quantize` is applied on the non-streaming load path only;
-        # under `streaming` the option was silently ignored, so the arm scored the
-        # *unquantized* model against the unquantized reference and reported KLD ~0 --
-        # which reads as a column of zeroes rather than as an error, and is
-        # indistinguishable from a lossless quantizer. Fail instead.
+        # `quantize` builds through the streaming skeleton (see _quantize_streaming), so
+        # it needs the shard index and the meta model that branch sets up -- but the
+        # result is fully resident and scores on the ordinary path. Asking for both is a
+        # contradiction rather than a combination, and silently ignoring one of them is
+        # how this option first shipped: `streaming: true` skipped quantization entirely
+        # and scored the *unquantized* model against the unquantized reference, reporting
+        # KLD ~0. A column of zeroes, indistinguishable from a lossless quantizer.
         if self.quantize_spec and self.streaming:
             raise ValueError(
-                "options.quantize cannot be combined with options.streaming: the "
-                "streaming loader materializes weights per module from the shards and "
-                "returns them to meta, so there is no resident model to quantize and the "
-                "spec would be silently ignored (scoring the bf16 model, KLD ~0). Drop "
-                "streaming, or quantize to a checkpoint first and point `source` at it."
+                "options.quantize and options.streaming are mutually exclusive: quantize "
+                "already loads through the streaming skeleton and leaves the quantized "
+                "model resident, which is what makes it work on a model larger than the "
+                "GPU. Remove `streaming: true`."
             )
         self.shard_handles = {}
 
-        if self.streaming:
+        if self.streaming or self.quantize_spec:
             import json
             import struct
             from accelerate import init_empty_weights
@@ -609,6 +610,10 @@ class TransformersBackend:
             embed = self.model.get_input_embeddings()
             self.head_weight_name = f"{self.prefix[id(head)]}.weight" if head is not None else None
             self.embed_weight_name = f"{self.prefix[id(embed)]}.weight"
+
+            if self.quantize_spec:
+                self._quantize_streaming(source)
+                self.model.eval()
         else:
             try:
                 self.model = AutoModelForCausalLM.from_pretrained(
@@ -625,8 +630,6 @@ class TransformersBackend:
                     device_map = options.get("device_map", "auto"),
                     trust_remote_code = options.get("trust_remote_code", True),
                 )
-            if self.quantize_spec:
-                self._quantize_in_process(source)
             self.model.eval()
 
         # Biases and norms are 1D (excluded by the ndim test); router gates excluded by name.
@@ -725,34 +728,124 @@ class TransformersBackend:
             if disk.get("bpw_layer"):
                 self.info = disk
 
-    def _quantize_in_process(self, source: str):
-        """Quantize the freshly loaded bf16 model with SINQ's own API.
+    def _quantize_streaming(self, source: str):
+        """Quantize block by block off the shards, never holding the whole bf16 model.
 
-        `spec` is passed through to sinq_base_quant_config, so nbits / group_size /
-        tiling_mode / method ('sinq' or 'asinq') all apply. A-SINQ is calibrated and takes
-        the tokenizer, which is why this goes through quantize_model rather than a
-        transformers quantization_config.
+        The reason this exists rather than a from_pretrained + quantize_model: the model
+        being quantized is routinely larger than anything it can be loaded into.
+        gemma-4-12B is 22.3 GiB of weights against a 16.3 GiB card and ~20 GiB of RAM, so
+        it fits in neither, and `device_map="auto"` does not rescue it -- accelerate
+        assigns the overflow to meta and SINQ's patcher does a plain `.to(device)` on it,
+        which fails with "Cannot copy out of meta tensor" before any quantization starts.
+        Disk offload fails the same way, because the patcher walks modules rather than
+        going through forward, so accelerate's materialize-on-access hooks never fire.
+
+        Peak here is one bf16 block plus the quantized model accumulated so far --
+        ~8.5 GiB for gemma-4-12B at 4 bits, against 22.3 GiB to hold it dense.
+
+        A-SINQ is calibrated, and the calibration is what forces the ordering: each block
+        needs the activations its linears actually see, which are the output of every
+        block before it. So one forward per block, hooks capturing inputs, and the *same*
+        forward produces the hidden states for the next block. It is deliberately the
+        **unquantized** block that propagates, matching sinq.awq.collect_activations_
+        blockwise, which collects every activation before quantizing anything; propagating
+        through the quantized block instead would fold accumulated error into the
+        calibration and would no longer be the method as published.
         """
-        from transformers import AutoTokenizer
-        from sinq.patch_model import AutoSINQHFModel
-        from sinq.sinqlinear import BaseQuantizeConfig
+        import torch.nn as nn
+        from sinq.sinqlinear import SINQLinear, BaseQuantizeConfig
 
         spec = dict(self.quantize_spec)
         spec.pop("backend", None)
         # BaseQuantizeConfig's own default method is "dual", not "sinq" -- a different
         # variant that keeps fp16 metadata and measures 4.51 bpw at nbits=4/group 64
         # against "sinq"'s 4.28. Omitting `method` in a project file would silently mix
-        # two quantizers in one sweep, so default it to the named method instead and
-        # print what actually ran.
+        # two quantizers in one sweep, so default it to the named method instead.
         spec.setdefault("method", "sinq")
         cfg = BaseQuantizeConfig(**spec)
-        print(f" -- quantizing in process: "
-              + ", ".join(f"{k}={v}" for k, v in sorted(spec.items())))
-        tok = AutoTokenizer.from_pretrained(source)
-        AutoSINQHFModel.quantize_model(
-            self.model, tokenizer = tok, quant_config = cfg,
-            compute_dtype = torch.bfloat16, device = str(self.device),
-        )
+        needs_calib = "awq" in cfg["weight_quant_params"]["method"]
+        print(f" -- quantizing per block: "
+              + ", ".join(f"{k}={v}" for k, v in sorted(spec.items()))
+              + (" (calibrated)" if needs_calib else ""))
+
+        layers = self._decoder_layers()
+        in_layer = {id(m) for lyr in layers for m in lyr.modules()}
+
+        # Everything outside the decoder stack -- embedding, final norm, an untied head --
+        # stays dense and has to be resident before any forward can run.
+        for m in self.model.modules():
+            if id(m) in in_layer:
+                continue
+            if any(p is not None for p in m._parameters.values()):
+                self._materialize(m)
+        # Materializing modules one at a time gives a tied head its *own* copy of the
+        # embedding, which both wastes its bytes and defeats the `head_numel == 0` test
+        # the accounting uses to detect tying -- vram_gb came out one whole embedding too
+        # large (0.7988 against 0.5090 on Qwen3-0.6B). Re-tie. No-op when the config does
+        # not tie.
+        self.model.tie_weights()
+
+        hidden = seq_lens = None
+        if needs_calib:
+            from transformers import AutoTokenizer
+            from sinq.awq import get_simple_calibration_data
+            tok = AutoTokenizer.from_pretrained(source)
+            calib = get_simple_calibration_data(tokenizer = tok)
+            embed = self.model.get_input_embeddings()
+            with torch.inference_mode():
+                hidden = [embed(c.to(self.device)) for c in calib]
+            seq_lens = [h.shape[1] for h in hidden]
+
+        rotary = getattr(self.model.base_model, "rotary_emb", None)
+
+        with ProgressBar("Quantizing", len(layers)) as pb:
+            for idx, layer in enumerate(layers):
+                self._materialize(layer)
+
+                acts, hooks = {}, []
+                if needs_calib:
+                    def hook(mod, inp, out, name):
+                        acts.setdefault(name, []).append(inp[0].detach().cpu().bfloat16())
+                    for name, sub in layer.named_modules():
+                        if isinstance(sub, nn.Linear):
+                            hooks.append(sub.register_forward_hook(
+                                lambda m, i, o, n = name: hook(m, i, o, n)))
+                    nxt = []
+                    with torch.inference_mode():
+                        for h, sl in zip(hidden, seq_lens):
+                            pos = torch.arange(sl, device = self.device).unsqueeze(0)
+                            out = layer(
+                                h,
+                                position_ids = pos,
+                                position_embeddings = rotary(h, pos) if rotary else None,
+                                cache_position = torch.arange(sl, device = self.device),
+                            )
+                            nxt.append(out[0] if isinstance(out, tuple) else out)
+                    for hk in hooks:
+                        hk.remove()
+                    hidden = nxt
+                    acts = {k: torch.cat(v, dim = 0) for k, v in acts.items()}
+
+                # Replace in place, parent by parent. SINQLinear(del_orig=True) drops the
+                # dense weight as it goes, so the bf16 block is never fully duplicated.
+                for pname, parent in list(layer.named_modules()):
+                    for cname, child in list(parent.named_children()):
+                        if not isinstance(child, nn.Linear):
+                            continue
+                        full = f"{pname}.{cname}" if pname else cname
+                        setattr(parent, cname, SINQLinear(
+                            child, cfg,
+                            compute_dtype = self.dtype,
+                            device = str(self.device),
+                            layer_activations = acts.get(full),
+                        ))
+                del acts
+                free_mem()
+                pb.update(idx + 1)
+
+        # The skeleton exists only to be filled block by block; from here the model is
+        # fully resident and scores on the ordinary path.
+        self.streaming = False
 
     def _sinq_storage_bits(self):
         """Bits held by in-process SINQ layers, which no parameter walk can see.
