@@ -796,7 +796,46 @@ class TransformersBackend:
                 hidden = [embed(c.to(self.device)) for c in calib]
             seq_lens = [h.shape[1] for h in hidden]
 
-        rotary = getattr(self.model.base_model, "rotary_emb", None)
+        rotary = layer_types = None
+        if needs_calib:
+            import inspect
+            # Not `base_model.rotary_emb`: on a composite model the text stack is nested,
+            # and passing None where a layer wants `cos, sin = position_embeddings` fails
+            # with a bare "cannot unpack non-iterable NoneType".
+            for name, mod in self.model.named_modules():
+                if name.endswith("rotary_emb") and "vision" not in name and "audio" not in name:
+                    rotary = mod
+                    break
+            if rotary is None:
+                raise RuntimeError(
+                    "calibrated quantization needs the text stack's rotary embedding to "
+                    "reproduce each block's inputs, and none was found on this model"
+                )
+            cfg_obj = _read_config(source)
+            cfg_obj = cfg_obj.get("text_config") or cfg_obj
+            # gemma-4 computes a *different* rope per layer type and selects it with
+            # config.layer_types[i] (modeling_gemma4_unified.py:660-674). Feeding every
+            # layer the global rope would calibrate the sliding layers against inputs they
+            # never see -- wrong, and silently so. Take the type from the config the way
+            # the model does, when the rotary accepts one.
+            if len(inspect.signature(rotary.forward).parameters) >= 3:
+                layer_types = cfg_obj.get("layer_types")
+                if not layer_types or len(layer_types) != len(layers):
+                    raise RuntimeError(
+                        "this model's rotary embedding is per-layer-type but "
+                        "config.layer_types does not enumerate the decoder layers, so the "
+                        "per-block calibration inputs cannot be reproduced faithfully"
+                    )
+            # Each block is run with default (full causal) masking. That is only equal to
+            # the real thing while no sliding window binds, so require it rather than
+            # assume it: the calibration rows are short and gemma's windows are not.
+            win = cfg_obj.get("sliding_window")
+            if win and max(seq_lens) > win:
+                raise RuntimeError(
+                    f"calibration rows are {max(seq_lens)} tokens against a sliding "
+                    f"window of {win}: the per-block forward here masks full-causal, "
+                    f"which would no longer match what the sliding layers actually see"
+                )
 
         with ProgressBar("Quantizing", len(layers)) as pb:
             for idx, layer in enumerate(layers):
@@ -811,20 +850,58 @@ class TransformersBackend:
                             hooks.append(sub.register_forward_hook(
                                 lambda m, i, o, n = name: hook(m, i, o, n)))
                     nxt = []
-                    with torch.inference_mode():
+                    try:
+                      with torch.inference_mode():
                         for h, sl in zip(hidden, seq_lens):
                             pos = torch.arange(sl, device = self.device).unsqueeze(0)
+                            pe = (rotary(h, pos, layer_types[idx]) if layer_types
+                                  else rotary(h, pos))
                             out = layer(
                                 h,
                                 position_ids = pos,
-                                position_embeddings = rotary(h, pos) if rotary else None,
+                                position_embeddings = pe,
                                 cache_position = torch.arange(sl, device = self.device),
                             )
                             nxt.append(out[0] if isinstance(out, tuple) else out)
+                    except (TypeError, AttributeError) as e:
+                        # The block wants something a plain hidden-state forward does not
+                        # carry. Gemma-3n-style stacks are the case in hand: the layer
+                        # takes a per-layer embedding side channel and dies on
+                        # `Tensor * None` inside its own forward before any linear runs.
+                        # Say so, rather than surfacing an arithmetic error from inside
+                        # transformers that looks like a quantizer bug.
+                        for hk in hooks:
+                            hk.remove()
+                        raise RuntimeError(
+                            f"calibrated quantization: decoder layer {idx} "
+                            f"({type(layer).__name__}) cannot be driven by hidden states "
+                            f"alone -- it raised {type(e).__name__}: {e}. This "
+                            f"architecture feeds its blocks inputs the per-block "
+                            f"calibration loop does not reproduce; use method: sinq, "
+                            f"which needs no activations at all."
+                        ) from e
                     for hk in hooks:
                         hk.remove()
                     hidden = nxt
                     acts = {k: torch.cat(v, dim = 0) for k, v in acts.items()}
+                    # A linear that never fired has no activations to calibrate against.
+                    # SINQ's awq path multiplies the weight by them and would die on
+                    # `Tensor * None`; quantizing those few uncalibrated instead would
+                    # silently mix two methods inside one model, which is worse. Gemma-3n
+                    # style stacks hit this: `per_layer_input_gate` and
+                    # `per_layer_projection` are fed by a per-layer embedding side channel
+                    # rather than by the hidden states this loop propagates.
+                    missing = [n for n, sub in layer.named_modules()
+                               if isinstance(sub, nn.Linear) and n not in acts]
+                    if missing:
+                        raise RuntimeError(
+                            f"calibrated quantization: {len(missing)} linear(s) in decoder "
+                            f"layer {idx} received no activations because a plain "
+                            f"hidden-state forward does not reach them "
+                            f"({', '.join(missing[:4])}). This architecture feeds them "
+                            f"from a side channel the per-block calibration loop does not "
+                            f"reproduce; use method: sinq, which needs no activations."
+                        )
 
                 # Replace in place, parent by parent. SINQLinear(del_orig=True) drops the
                 # dense weight as it goes, so the bf16 block is never fully duplicated.
