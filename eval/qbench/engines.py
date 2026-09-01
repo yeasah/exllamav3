@@ -1686,6 +1686,10 @@ class VllmBackend:
 
     def __init__(self, source: str, max_len: int, device: torch.device, options: dict):
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+        # Usage reporting runs on a background thread that calls py-cpuinfo, which throws
+        # JSONDecodeError on some hosts and prints a full traceback before every single
+        # run. Nothing depends on it and a benchmark harness should not be phoning home.
+        os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
         _install_vllm_prompt_logprob_hook()
 
         self.device = device
@@ -1716,7 +1720,21 @@ class VllmBackend:
         )
         self.info = safetensors_storage_info(source, tied_embed_from_head=tied_embed)
 
-        llm_kwargs.setdefault("gpu_memory_utilization", 0.85)
+        if "gpu_memory_utilization" not in llm_kwargs:
+            # Not a constant, because `close()` cannot fully reclaim. vLLM sizes its pool
+            # as a fraction of *total* memory but must find that much *free*, so memory a
+            # previous model left behind turns into an unachievable request rather than a
+            # smaller pool -- the failure is an OOM on the second vllm arm, or a
+            # nondeterministic one later. Measured on 0.28.1: ~160-230 MiB unreclaimed per
+            # load/close cycle and growing, on top of vLLM's own teardown.
+            #
+            # The headroom covers the reference logits, which are held on device while
+            # scoring: [max_len, vocab] in fp32 is 1.16 GiB at 2048 x 151936.
+            free, total = torch.cuda.mem_get_info(device)
+            util = max(0.30, min(0.85, free / total - 0.12))
+            print(f" -- vllm: gpu_memory_utilization {util:.2f} "
+                  f"({free / 1024 ** 3:.1f} of {total / 1024 ** 3:.1f} GiB free)")
+            llm_kwargs["gpu_memory_utilization"] = util
         llm_kwargs.setdefault("enforce_eager", True)
         llm_kwargs.setdefault("max_num_seqs", 1)
         try:
