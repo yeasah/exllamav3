@@ -795,6 +795,17 @@ class TransformersBackend:
             with torch.inference_mode():
                 hidden = [embed(c.to(self.device)) for c in calib]
             seq_lens = [h.shape[1] for h in hidden]
+            # Gemma-4 shares K/V between layers of the same type through one dict threaded
+            # down the whole stack: a producer layer writes it
+            # (`shared_kv_states[self.layer_type] = key_states, value_states`) and later
+            # layers of that type read it back instead of recomputing. So it is per-sample
+            # state that has to survive *across* blocks -- and this loop walks blocks
+            # outside and samples inside, which is the transpose of the model's own order.
+            # One dict per sample, carried alongside its hidden states. Passing None gets
+            # "'NoneType' object does not support item assignment" from the first producer
+            # -- layer 46 of 48 on gemma-4-12B, so it fails only after most of the model
+            # has already calibrated.
+            shared_kv = [{} for _ in hidden]
 
         rotary = layer_types = None
         if needs_calib:
@@ -849,10 +860,13 @@ class TransformersBackend:
                         if isinstance(sub, nn.Linear):
                             hooks.append(sub.register_forward_hook(
                                 lambda m, i, o, n = name: hook(m, i, o, n)))
+                    import inspect as _inspect
+                    takes_shared_kv = "shared_kv_states" in _inspect.signature(
+                        layer.forward).parameters
                     nxt = []
                     try:
                       with torch.inference_mode():
-                        for h, sl in zip(hidden, seq_lens):
+                        for si, (h, sl) in enumerate(zip(hidden, seq_lens)):
                             pos = torch.arange(sl, device = self.device).unsqueeze(0)
                             pe = (rotary(h, pos, layer_types[idx]) if layer_types
                                   else rotary(h, pos))
@@ -861,6 +875,9 @@ class TransformersBackend:
                                 position_ids = pos,
                                 position_embeddings = pe,
                                 cache_position = torch.arange(sl, device = self.device),
+                                use_cache = False,
+                                **({"shared_kv_states": shared_kv[si]}
+                                   if takes_shared_kv else {}),
                             )
                             nxt.append(out[0] if isinstance(out, tuple) else out)
                     except (TypeError, AttributeError) as e:
