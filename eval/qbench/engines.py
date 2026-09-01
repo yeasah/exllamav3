@@ -383,6 +383,13 @@ class TransformersBackend:
         self.device = device
         self.dtype = dtype
         self.streaming = options.get("streaming", False)
+        # Quantize in-process instead of loading a quantized checkpoint. Exists because
+        # two things worth measuring cannot reach here any other way: SINQ's 2D tiling
+        # quantizes and serves correctly but does not survive save_pretrained ->
+        # from_pretrained, and its calibrated A-SINQ is refused outright by the
+        # transformers integration. Both work through SINQ's own quantize_model(). It is
+        # also simply cheaper for a sweep -- 1.5 s and no checkpoint per point.
+        self.quantize_spec = options.get("quantize")
         self.shard_handles = {}
 
         if self.streaming:
@@ -605,6 +612,8 @@ class TransformersBackend:
                     device_map = options.get("device_map", "auto"),
                     trust_remote_code = options.get("trust_remote_code", True),
                 )
+            if self.quantize_spec:
+                self._quantize_in_process(source)
             self.model.eval()
 
         # Biases and norms are 1D (excluded by the ndim test); router gates excluded by name.
@@ -676,7 +685,19 @@ class TransformersBackend:
             "bpw_embed": embed_bits / max(embed_numel, 1),
             "vram_gb": (sum_bits + head_bits + (0 if tied_head else embed_bits)) / 8 / 1024 ** 3,
         }
-        if sum_numel == 0 and qcfg and os.path.isdir(source):
+        if self.quantize_spec:
+            # No checkpoint to measure: the quantized weights only exist in memory.
+            q_bits, q_numel = self._sinq_storage_bits()
+            if q_numel:
+                sum_bits, sum_numel = q_bits, q_numel
+                self.info = {
+                    "bpw_layer": sum_bits / sum_numel,
+                    "bpw_head": head_bits / max(head_numel, 1),
+                    "bpw_embed": embed_bits / max(embed_numel, 1),
+                    "vram_gb": (sum_bits + head_bits
+                                + (0 if tied_head else embed_bits)) / 8 / 1024 ** 3,
+                }
+        elif sum_numel == 0 and qcfg and os.path.isdir(source):
             # The walk above sees nothing, so every quantized layer was invisible to
             # named_parameters()/named_buffers(). That is not hypothetical: SINQ holds
             # `W_q` as a plain tensor attribute and its scales in a plain dict, so a
@@ -690,6 +711,63 @@ class TransformersBackend:
             disk = safetensors_storage_info(source)
             if disk.get("bpw_layer"):
                 self.info = disk
+
+    def _quantize_in_process(self, source: str):
+        """Quantize the freshly loaded bf16 model with SINQ's own API.
+
+        `spec` is passed through to sinq_base_quant_config, so nbits / group_size /
+        tiling_mode / method ('sinq' or 'asinq') all apply. A-SINQ is calibrated and takes
+        the tokenizer, which is why this goes through quantize_model rather than a
+        transformers quantization_config.
+        """
+        from transformers import AutoTokenizer
+        from sinq.patch_model import AutoSINQHFModel
+        from sinq.sinqlinear import BaseQuantizeConfig
+
+        spec = dict(self.quantize_spec)
+        spec.pop("backend", None)
+        cfg = BaseQuantizeConfig(**spec)
+        tok = AutoTokenizer.from_pretrained(source)
+        AutoSINQHFModel.quantize_model(
+            self.model, tokenizer = tok, quant_config = cfg,
+            compute_dtype = torch.bfloat16, device = str(self.device),
+        )
+
+    def _sinq_storage_bits(self):
+        """Bits held by in-process SINQ layers, which no parameter walk can see.
+
+        `W_q` is a plain tensor attribute and the scales/zeros live in a plain dict, so
+        `named_parameters()` and `named_buffers()` both return nothing for a quantized
+        layer -- see the fallback in __init__. On a checkpoint that is answered by reading
+        the file; quantized in process there is no file, so the module tree has to be
+        walked by attribute instead. Returns (bits, logical weight count).
+        """
+        bits = numel = 0
+        for m in self.model.modules():
+            wq = getattr(m, "W_q", None)
+            if wq is None or not torch.is_tensor(wq):
+                continue
+            meta = getattr(m, "meta", None) or {}
+            nbits = meta.get("nbits") or self.quantize_spec.get("nbits", 4)
+            bits += wq.numel() * wq.element_size() * 8
+            # meta nests, and not as a dict: with quantized metadata (SINQ's default)
+            # meta["scale"] and meta["zero"] are *tuples* of an int8 payload plus its own
+            # fp16 min and scale -- the three the checkpoint writes as meta.scale.{m,s,x}.
+            # Counting only top-level tensors undercounts by 0.27 bpw at group 64 (4.010
+            # against the file's 4.276), which is precisely the int8 scale and zero
+            # payloads at 16 bits per group of 64. Walk containers, not just mappings.
+            def meta_bits(v):
+                if torch.is_tensor(v):
+                    return v.numel() * v.element_size() * 8
+                if isinstance(v, dict):
+                    return sum(meta_bits(x) for x in v.values())
+                if isinstance(v, (tuple, list)):
+                    return sum(meta_bits(x) for x in v)
+                return 0
+            bits += meta_bits(meta)
+            # W_q is packed: several logical weights per stored element.
+            numel += wq.numel() * (wq.element_size() * 8 // int(nbits))
+        return bits, numel
 
     def _decoder_layers(self):
         best = None
