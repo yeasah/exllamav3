@@ -753,7 +753,22 @@ class TransformersBackend:
         calibration and would no longer be the method as published.
         """
         import torch.nn as nn
+        from sinq import sinqlinear as _sinqlin
         from sinq.sinqlinear import SINQLinear, BaseQuantizeConfig
+
+        # Force SINQ's PyTorch dequant path rather than its fused gemlite kernel. Two
+        # reasons, and the second is the one that would matter even if the first went away.
+        #
+        # It is fragile: gemlite's Triton autotuner found no valid config for Qwen3-8B's
+        # shapes on sm_120 and died inside `min()` on an empty candidate list
+        # (triton/runtime/autotuner.py:232), after the same code had worked on Qwen3-0.6B
+        # and gemma-4-12B. A benchmark should not lose an arm to kernel autotuning.
+        #
+        # And it is the wrong thing to measure. qbench scores *formats*; which fused kernel
+        # multiplies the dequantized weights is an inference-speed concern, and letting it
+        # vary by shape or GPU puts kernel numerics into a quality number.
+        _gemlite_was = _sinqlin._HAVE_GEMLITE
+        _sinqlin._HAVE_GEMLITE = False
 
         spec = dict(self.quantize_spec)
         spec.pop("backend", None)
@@ -936,6 +951,8 @@ class TransformersBackend:
                 del acts
                 free_mem()
                 pb.update(idx + 1)
+
+        _sinqlin._HAVE_GEMLITE = _gemlite_was
 
         # The skeleton exists only to be filled block by block; from here the model is
         # fully resident and scores on the ordinary path.
