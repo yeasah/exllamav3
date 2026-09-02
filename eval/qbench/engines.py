@@ -2014,10 +2014,20 @@ class VllmBackend:
             # nondeterministic one later. Measured on 0.28.1: ~160-230 MiB unreclaimed per
             # load/close cycle and growing, on top of vLLM's own teardown.
             #
-            # The headroom covers the reference logits, which are held on device while
-            # scoring: [max_len, vocab] in fp32 is 1.16 GiB at 2048 x 151936.
+            # Headroom is derived from what actually has to fit outside vLLM's pool rather
+            # than guessed as a fraction. The reference logits are held on device while
+            # scoring -- [max_len, vocab] in fp32, 1.16 GiB at 2048 x 151936 -- and that
+            # size is *independent of the model*, which is why a fixed fraction that left
+            # plenty on a 0.6B model left nothing on an 8B one and OOMed every vllm arm.
+            # vLLM also overshoots its own target by ~1.8 GiB of non-torch memory (CUDA
+            # context, kernels) that gpu_memory_utilization does not bound, measured on
+            # 0.28.1. So reserve the logits with room for a working copy, plus that.
             free, total = torch.cuda.mem_get_info(device)
-            util = max(0.30, min(0.85, free / total - 0.12))
+            cfg_v = _read_config(source)
+            cfg_v = cfg_v.get("text_config") or cfg_v
+            vocab = cfg_v.get("vocab_size") or 262144
+            reserve = 2.5 * max_len * vocab * 4 + 2.0 * 1024 ** 3
+            util = max(0.30, min(0.85, (free - reserve) / total))
             print(f" -- vllm: gpu_memory_utilization {util:.2f} "
                   f"({free / 1024 ** 3:.1f} of {total / 1024 ** 3:.1f} GiB free)")
             llm_kwargs["gpu_memory_utilization"] = util
