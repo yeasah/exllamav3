@@ -268,13 +268,17 @@ only a small amount of shared-memory overprovisioning, not runtime.
 
 ### `EXL3_MOE_CPU_MAX_ISA` (default: unset, auto-detect)
 
-Caps the CPU kernel's runtime ISA detection at `scalar`, `avx2`, `vnni`/`avx512`, or `vbmi`,
-for testing a lower-tier kernel path on hardware that supports better. The `vbmi` tier
+Caps the CPU kernel's runtime ISA detection at `scalar`, `avx2`, `bw`/`avx512bw`,
+`vnni`/`avx512`, or `vbmi`, for testing a lower-tier kernel path on hardware that supports
+better. The `bw` tier covers AVX-512F/BW/VL hardware without VNNI (Skylake-SP/X: 1st-gen Xeon
+Scalable, Core-X), which previously fell through to `avx2`: the `vnni` dword kernel with the
+AVX2 tier's vpmaddubsw/vpmaddwd accumulate, ~1.5x the `avx2` tier's cold-expert decode
+throughput on a Xeon Gold 6148. The `vbmi` tier
 (AVX512-VBMI byte-gather state extraction, Zen 4+ / Ice Lake+; Cascade/Cooper Lake have VNNI
 without VBMI and stay on the `vnni` tier) is 15-70% faster than the dword scheme depending on
 bitrate. Never upgrades past what the CPU actually supports; unrecognized values are ignored.
 Read once per process (parent and worker independently), so it must be set before either is
-started. Note that capping below `vbmi` also disables the swizzled weight layout (see
+started. Note that capping below `bw` also disables the swizzled weight layout (see
 `EXL3_MOE_CPU_SWIZZLE`).
 
 ### `EXL3_MOE_CPU_SWIZZLE` (default: `1`)
@@ -282,11 +286,14 @@ started. Note that capping below `vbmi` also disables the swizzled weight layout
 Repack the CPU worker's expert trellis copies into a band-contiguous ("swizzled") layout at
 load, so each GEMV band streams sequentially from DRAM instead of in short strided runs
 (+45-75% cold decode GEMV throughput measured on a 7960X, reaching the sequential-read
-roofline). Only takes effect when the `vbmi` kernel tier is active, whose byte-gather
-extraction leaves the register headroom for the wide bands the swizzled layout wants at
-m > 1; K8 tensors always stay in the native layout (they route to the dword kernel). The
-GPU-streaming prefill path un-swizzles during staging, so staged bytes reaching the GPU
-dequant are unaffected. Set to `0` to keep the native layout.
+roofline). Takes effect on every AVX-512 kernel tier: `vbmi`, whose byte-gather extraction
+leaves the register headroom for the wide bands the swizzled layout wants at m > 1, `bw`
+(+2-29% on Skylake-SP, where the sequential per-band k-stream beats 96-128 B strided reads)
+and `vnni` (the dword kernel with the same band structure; +40% cold-expert decode measured
+with the tier forced on a 7960X). The `avx2` and `scalar` tiers read the native layout. K8
+tensors always stay in the native layout (they route to the dword kernel). The GPU-streaming
+prefill path un-swizzles during staging, so staged bytes reaching the GPU dequant are
+unaffected. Set to `0` to keep the native layout.
 
 ### `EXL3_MOE_MEMOPS` (default: `1`)
 
@@ -325,7 +332,18 @@ offloaded layer have been loaded, deliberately not via a live `MADV_HUGEPAGE` hi
 per-layer writes: on hosts where `/sys/kernel/mm/transparent_hugepage/defrag` is `madvise`, that
 hint makes the kernel do *synchronous* compaction on first touch of a hinted region once
 easily-compactable free memory runs low, which turns into multi-second stalls per offloaded
-layer partway through a large model's load. Set to `0` to skip hugepage promotion entirely.
+layer partway through a large model's load. The collapse pass runs on a background thread in
+the worker after it has started serving: it copies the whole arena (about 4 GiB/s on a
+7960X when the chunks were faulted as 4K pages, i.e. on `transparent_hugepage/enabled =
+madvise` hosts, plus any compaction the kernel needs first), so it must not sit on the
+startup path; the worker reads 4K pages until each chunk lands. `EXL3_MOE_ARENA_DEBUG=1`
+prints how long it took. Set to `0` to skip hugepage promotion entirely.
+
+### `EXL3_MOE_CPU_START_TIMEOUT` (default: `60`)
+
+Seconds the parent waits for the CPU worker to signal ready after every offloaded layer has
+been handed over. Startup is the shared-memory attach, layer registration and thread spawn,
+so the default is only a safety net against a wedged worker; raise it on very slow hosts.
 
 ### `EXL3_MOE_CPU_PIN` (default: `1`)
 
@@ -343,12 +361,53 @@ read.
 
 Enable GPU/CPU handoff profiling, for debug purposes. 
 
+## Model loading
+
+### `EXL3_EXPANDABLE_SEGMENTS` (default: `1`)
+
+Use expandable segments for all Torch allocations. Opt out with a value of 1 or by explicitly
+setting `PYTORCH_CUDA_ALLOC_CONF`.
+
+### `EXL3_LOAD_ARENA` (default: `1`)
+
+Slab allocation for small weight tensors during (deferred) module loads: tensors up to 16 MB
+are carved out of shared 128 MB per-device blocks (first-fit over the open blocks, so partially
+filled tails are packed by later small tensors) instead of getting one CUDA caching-allocator
+allocation each. MoE models with many small per-expert tensors otherwise shatter the allocator
+into tens of thousands of segments with large reserved-but-unallocated overhead. Unloading a
+module frees its blocks; at most one boundary block shared with a neighboring module stays
+pinned. Set to `0` to fall back to per-tensor allocations.
+
+### `EXL3_NGRAM_STREAM` (default: `1`)
+
+Default for `Config.infer_params.ngram_stream_from_disk`: stream an n-gram embedding table
+(PLE models, e.g. Qwen3.8-Flash-Next) from disk with per-forward row gathers (run-coalesced
+positioned reads into pinned staging — threaded preads on Linux, overlapped `ReadFile` at high
+queue depth on Windows) instead of loading the whole table into system RAM. The quantized table
+is tens of GB, and streaming costs little on SSD-class storage (decode is latency-tolerant at
+~30 rows/token; prefill gathers are batched). Set to `0` to hold the table in RAM — worthwhile
+only when the table lives on high-latency storage (e.g. HDD, where per-row seeks make streaming
+unusable). Also settable per load via `config.infer_params.ngram_stream_from_disk` or
+`--ngram_ram` in `model_init`-based scripts.
+
+### `EXL3_VISION_PINNED` (default: `0`)
+
+Default for `Config.infer_params.vision_pinned`: store the vision component's linear-layer
+weights (fp16 or EXL3 trellis) in pinned host memory instead of VRAM, computing straight from
+a zero-copy device alias. Trades vision-tower speed for VRAM. Set before loading the vision
+component.
+
 ## Multi-GPU
 
 ### `EXLLAMA_NO_P2P_COPY` (default: unset)
 
-When set, device-to-device tensor moves in the layer split bounce through host memory instead
-of using peer-to-peer copies. Workaround for platforms with broken or misreported P2P support.
+Controls device-to-device tensor moves (the layer split boundary, draft/MTP heads reading the
+target model's states, sparse-attention selections shared between layers). On some platforms
+the driver reports peer-to-peer access that the PCIe fabric does not deliver, and a direct copy
+silently yields garbage. Unset: the first move between each pair of GPUs probes it (a few
+random floats there and back, checked on the host) and, if the probe fails, every later move
+between that pair bounces through system memory, with a warning printed once. Set to `1`: always
+bounce, no probing. Set to `0`: always copy directly, no probing.
 
 ### `EXLLAMA_MASTER_ADDR` (default: `127.0.0.1`), `EXLLAMA_MASTER_PORT` (default: auto)
 
@@ -395,6 +454,13 @@ window. `0` disables the spin. Mostly useful on hosts where TP profiling shows a
 between the main process and child workers reaching their first kernel launch.
 
 ## Debug
+
+### `EXL3_NGRAM_GATHER_PROF` (default: unset)
+
+Windows only: print per-gather statistics from the streamed n-gram table path (unique rows,
+coalesced runs, reads completed synchronously vs left pending, span tasks drained by pool
+workers vs the calling thread). Activation check for the overlapped-`ReadFile` gather when
+validating a streamed-table model on Windows.
 
 ### `EXLLAMA_DEBUGLOG_<CATEGORY>` (default: unset)
 

@@ -100,7 +100,7 @@ GROUP_COLORS = [
 def make_palette(groups):
     """Fixed color per group name; reserved slots for common formats, remainder
     walks the CVD-optimized ladder in stable (sorted) order."""
-    fixed_cols = {"EXL3": 0, "AWQ": 1, "GGUF": 2, "GGUF-IQ": 4, "NVFP4": 5, "EXL3-SC": 3}
+    fixed_cols = {"EXL3": 0, "AWQ": 1, "GGUF": 9, "GGUF-IQ": 4, "NVFP4": 5, "EXL3-SC": 3}
     # Reserve a slot only for a fixed group that is actually in this project. Reserving
     # all six unconditionally spends 6 of 10 colors on formats that may not appear, so a
     # project with five or more groups of its own failed to plot at all -- which is how a

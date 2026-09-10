@@ -10,6 +10,7 @@ from pathlib import (Path)
 # ANSI codes
 col_default = "\u001b[0m"
 col_yellow = "\u001b[33;1m"
+col_red = "\u001b[31;1m"
 col_green = "\u001b[32;1m"
 
 MAX_DIM = 64  # maximum image dimension, in half-block pixels
@@ -93,7 +94,13 @@ def main(args):
     # Resolve filenames
     input_files = []
     for arg in args.input:
-        input_files += resolve_files(arg)
+        files = resolve_files(arg)
+        if not files:
+            print(f"{col_yellow}No such file: {arg}{col_default}")
+        input_files += files
+    if not input_files:
+        print(f"{col_red}No input images{col_default}")
+        sys.exit(1)
 
     # Prepare model etc.
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
@@ -107,6 +114,7 @@ def main(args):
     )
 
     # Load the image component model
+    config.infer_params.vision_pinned = config.infer_params.vision_pinned or args.vision_offload
     vision_model = Model.from_config(config, component = "vision")
     vision_model.load(progressbar = True)
 
@@ -124,7 +132,7 @@ def main(args):
 
         embed = vision_model.get_image_embeddings(tokenizer, img)
         prompt = model.default_chat_prompt(f"{embed.text_alias}\n{args.prompt.strip()}")
-        input_ids = tokenizer.encode(prompt, embeddings = [embed])
+        input_ids = tokenizer.encode(prompt, embeddings = [embed], encode_special_tokens = True)
 
         job = Job(
             input_ids = input_ids,
@@ -157,6 +165,7 @@ if __name__ == "__main__":
     model_init.add_args(parser, cache = True, default_cache_size = 16384, add_draft_model_args = True)
     parser.add_argument("-p", "--prompt", type = str, help = "Text prompt (default: Describe this image.)", default = "Describe this image.")
     parser.add_argument("-nr", "--no_render", action = "store_true", help = "Don't render images in the terminal")
+    parser.add_argument("-vo", "--vision_offload", action = "store_true", help = "Offload vision tower to system memory")
     parser.add_argument("input", nargs = "+", type = str, help = "Input files")
     _args = parser.parse_args()
     main(_args)
