@@ -21,6 +21,7 @@ import json
 import threading
 from pathlib import Path
 from collections import deque
+from huggingface_hub import snapshot_download
 import re
 
 col_default = "\u001b[0m"
@@ -67,6 +68,8 @@ monkeypatch_triton_autotuner_thread_safety()
 
 
 parser = argparse.ArgumentParser(allow_abbrev = False)
+parser.add_argument("-hf", "--hf_repo", type = str, default = None, help = "Huggingface repository name for input model")
+parser.add_argument("-hfr", "--hf_revision", type = str, default = None, help = "Huggingface revision for input model")
 parser.add_argument("-i", "--in_dir", type = str, default = None, help = "Input (model) directory")
 parser.add_argument("-w", "--work_dir", type = str, default = None, help = "Working directory")
 parser.add_argument("-o", "--out_dir", type = str, default = None, help = "Output directory")
@@ -170,12 +173,12 @@ def prepare_env(args):
 def prepare(args) -> (dict, dict, bool, str):
     check_system()
 
-    if not args.work_dir:
-        return None, None, False, "Must specify --work_dir"
-    if not args.in_dir and not args.resume:
-        return None, None, False, "Specify either --in_dir to start a new job or --resume to resume an interrupted job"
-    if not args.out_dir and not args.resume:
-        return None, None, False, "Must specify --out_dir or --resume"
+    if not args.hf_repo and not args.work_dir:
+        return None, None, False, "Must specify --work_dir (or --hf_repo)"
+    if not args.hf_repo and not args.in_dir and not args.resume:
+        return None, None, False, "Specify either --in_dir (or --hf_repo) to start a new job or --resume to resume an interrupted job"
+    if not args.hf_repo and not args.out_dir and not args.resume:
+        return None, None, False, "Must specify --out_dir (or --hf_repo) or --resume"
     if args.codebook not in ["mcg", "mul1", "3inst"]:
         return None, None, False, "Codebook must be 'mcg', 'mul1' or '3inst'"
     if args.bits is not None and (args.bits > 8 or args.bits < 1):
@@ -212,6 +215,36 @@ def prepare(args) -> (dict, dict, bool, str):
             print(" !! Warning: --recipe given, --bits is used for reporting only")
         if args.hq:
             print(" !! Warning: --hq has no effect with --recipe")
+
+    if args.hf_repo:
+        # download selected repo
+        print(f" downloading {args.hf_repo} from huggingface hub...")
+        path = snapshot_download(repo_id=args.hf_repo, revision=args.hf_revision)
+        args.in_dir = path
+        model_name = args.hf_repo.split('/')[1]
+        if args.hf_revision:
+            model_name += f"-{args.hf_revision}"
+
+        # create model name including bitrate info
+        model_name += "-exl3_"
+        body_bits = recipe_bits or args.bits
+        head_bits = recipe_head_bits or args.head_bits or 6
+        if recipe_bits:
+            model_name += f"SC-"
+        model_name += f"{round(body_bits,2):.2f}bpw"
+        if head_bits and head_bits != 6:
+            model_name += f"-H{round(head_bits,0)}"
+        # default vision bits is now architecture dependent, so flag that
+        if not args.vision_bits:
+            model_name += "-Vn"
+        elif args.vision_bits != 16:
+            model_name += f"-V{round(args.vision_bits,0)}"
+
+        # set default work and output directories based on model name
+        if not args.work_dir:
+            args.work_dir = f"work-{model_name}"
+        if not args.out_dir:
+            args.out_dir = model_name
 
     in_args = { "work_dir": args.work_dir }
     if args.resume:
