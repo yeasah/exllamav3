@@ -14,7 +14,8 @@ test_data:
 tokenizer:
   # Directory containing HF tokenizer, usually the HF reference model
   source: hf_model/
-  # (Loosely) apply model's chat template to all test rows, or use assistant-framing. Choices: true/false/assistant
+  # (Loosely) apply model's chat template to all test rows, or use assistant-framing. Choices: true/false/assistant/render
+  # render: each row sits exactly where the chat template puts an assistant reply's content
   template: true
 
 # Set `test_trace` and omit `test_data` and `tokenizer` to use an in-domain testset produced by qbench_prompts.py

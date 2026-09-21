@@ -247,6 +247,31 @@ def parse_int_list(
     return result
 
 
+_REPLY_SENTINEL = "QBENCHREPLYSENTINEL"
+
+
+def hf_chat_template_reply_prefix(tokenizer, messages: list) -> torch.Tensor:
+    """
+    Token ids the chat template renders ahead of an assistant reply's content, shape (1, n).
+
+    Renders `messages` plus a finished assistant reply whose content is a sentinel, cuts the text
+    at the sentinel and tokenizes the head the way apply_chat_template(tokenize = True) does:
+    add_special_tokens = False, so BOS is present exactly when the template itself emits it. The
+    sentinel has no whitespace or markup for a template to strip or escape, and the reply's end
+    tokens are dropped -- a test row is cut at an arbitrary point, so end-of-message is not what
+    comes next.
+    """
+    rendered = tokenizer.hf_render_chat_template(
+        messages + [{"role": "assistant", "content": _REPLY_SENTINEL}],
+        add_generation_prompt = False,
+    )
+    if rendered.count(_REPLY_SENTINEL) != 1:
+        raise ValueError("chat template did not render the assistant reply content verbatim")
+    head = rendered[:rendered.index(_REPLY_SENTINEL)]
+    ids = tokenizer.hf_tokenizer(head, add_special_tokens = False)["input_ids"]
+    return torch.tensor(ids, dtype = torch.long).unsqueeze(0)
+
+
 def prepend_hf_chat_context(tokenizer, tokens: torch.Tensor, mode: str = "generation",
                             prompt: str = "Say something."):
     """
@@ -256,12 +281,19 @@ def prepend_hf_chat_context(tokenizer, tokens: torch.Tensor, mode: str = "genera
     certainty). mode "assistant": renders an unterminated empty assistant message instead
     (continue_final_message), so the appended text lands at message-content position (gpt-oss:
     "...assistant<|channel|>final<|message|>"); equivalent to "generation" for plain templates.
+    mode "render": the context is exactly what the chat template renders ahead of a finished
+    assistant reply (see hf_chat_template_reply_prefix). Unlike "assistant" it keeps what the
+    template emits between header and content -- continue_final_message rstrips it, so Qwen3.6
+    loses the "\n\n" after "</think>" -- and unlike "generation" it never leaves the text inside
+    an opened "<think>" block, where thinking templates otherwise put it.
     """
     messages = [
         {"role": "system", "content": ""},
         {"role": "user", "content": prompt},
     ]
-    if mode == "assistant":
+    if mode == "render":
+        prefix = hf_chat_template_reply_prefix(tokenizer, messages)
+    elif mode == "assistant":
         prefix = tokenizer.hf_chat_template(
             messages + [{"role": "assistant", "content": ""}],
             add_special_tokens = True,

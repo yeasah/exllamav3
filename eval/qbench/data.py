@@ -284,8 +284,9 @@ def get_test_ids(project: dict, cache: QCache):
     if tok.get("template"):
         # template: true wraps rows after a bare generation prompt; template: assistant embeds
         # them as an unterminated assistant message (in-distribution for structured formats
-        # like gpt-oss harmony, equivalent otherwise)
-        mode = "assistant" if tok.get("template") == "assistant" else "generation"
+        # like gpt-oss harmony, equivalent otherwise); template: render uses exactly what the
+        # chat template emits ahead of a reply's content (see prepend_hf_chat_context)
+        mode = {"assistant": "assistant", "render": "render"}.get(tok.get("template"), "generation")
         ids = prepend_hf_chat_context(tokenizer, ids, mode = mode,
                                       prompt = tok.get("prompt", "Say something."))
         prefix_len = ids.shape[-1] - length
@@ -305,6 +306,8 @@ def dataset_subtitle(project: dict) -> str:
     st = f"{name}, {td['rows']} × {td['length']} tokens"
     if project["tokenizer"].get("template") == "assistant":
         st += ", assistant-framed"
+    elif project["tokenizer"].get("template") == "render":
+        st += ", chat-templated"
     elif project["tokenizer"].get("template"):
         st += ", formatted"
     return st
