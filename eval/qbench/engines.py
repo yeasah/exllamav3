@@ -2021,8 +2021,27 @@ def _quant_bits(config: dict) -> int | None:
 #: towers and speculative-decoding heads are real bytes that no text-only accounting
 #: should count; norms, biases and router gates are excluded by rule everywhere.
 _EXPECTED_ABSENT = (
-    "vision", "visual", "mm_projector", "multi_modal", "audio_tower", "mtp",
+    "vision", "visual", "mm_projector", "multi_modal", "audio", "mtp",
 )
+
+#: Unquantized structural weights that the shape and suffix rules below miss.
+#: Norms and scalars are caught by `len(shape) < 2`, but a depthwise short
+#: convolution is stored `[channels, 1, taps]` (or `[2, 2, width]`) -- 3-D, so it
+#: falls through to `unexplained` despite being exactly the same kind of thing: a
+#: small bf16 tensor no format quantizes and no bpw bucket should claim. On a
+#: 30-layer Qwen3.5-35B-A3B that is 30 x 64 KiB = 0.002 GiB, enough to put a
+#: warning on a model card and nothing else. Upstream excludes the same tensors
+#: from its GGUF walk (see `gguf_storage_info`); this is that rule for the
+#: safetensors one.
+#:
+#: **Matched as bare substrings, deliberately.** These were first written as
+#: `".conv1d."`, which across the local collection matched **1 of 17** conv1d
+#: families: the spelling varies (`linear_attn.conv1d`, `attention.k_conv1d`,
+#: `lconv1d`, and `*_conv.base_kernel` for DFlash), and anchoring on dots caught
+#: only the one that had been looked at. Nothing named this way is quantized
+#: storage in any checkpoint surveyed, and the check below only runs for modules
+#: that were *not* counted, so a quantized module of any name can never reach it.
+_UNQUANTIZED_STRUCTURAL = ("conv1d", "base_kernel")
 
 
 def check_against_disk(info: dict, source: str, counted_keys=None) -> dict:
@@ -2076,6 +2095,7 @@ def check_against_disk(info: dict, source: str, counted_keys=None) -> dict:
                 counted += nbytes
             elif (any(k in name for k in _EXPECTED_ABSENT)
                     or any(k in name for k in HF_ROUTER_KEYS)
+                    or any(k in name for k in _UNQUANTIZED_STRUCTURAL)
                     or name.endswith(".bias") or len(shape) < 2):
                 absent += nbytes
             else:
