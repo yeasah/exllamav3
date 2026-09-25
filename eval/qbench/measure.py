@@ -41,9 +41,11 @@ class DiffStats:
         self.kl_toks = []
         self.conf_toks = []
 
-    def __call__(self, r: int, logits: torch.Tensor):
+    def __call__(self, r: int, logits: torch.Tensor, offset: int = 0):
+        # logits cover positions [offset, offset + len): the whole row (offset 0), or just the
+        # score range when the engine ran its head on that range only
         a, b = self.ranges[r]
-        logits = logits[:, a:b, :].float()
+        logits = logits[:, a - offset:b - offset, :].float()
         logits.clamp_(min = -200.0)
 
         # ppl on own logits. Non-finite positions (a model NaN-ing on some input, e.g. fp16
@@ -111,8 +113,9 @@ class DiffStats:
         return res
 
 
-def save_reference_row(store_dir: str, r: int, logits: torch.Tensor, rng: tuple, conf_rows: list):
-    logits = logits[:, rng[0]:rng[1], :].float()
+def save_reference_row(store_dir: str, r: int, logits: torch.Tensor, rng: tuple, conf_rows: list,
+                       offset: int = 0):
+    logits = logits[:, rng[0] - offset:rng[1] - offset, :].float()
     logits.clamp_(min = -200.0)
     # reference top-token probability per position, for the confidence buckets
     l2 = logits.squeeze(0)

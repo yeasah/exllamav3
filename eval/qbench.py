@@ -145,10 +145,10 @@ def main(args):
         backend = open_backend(ref, max_len, device)
         stats = DiffStats(ids, ranges, vocab_size, None)
         conf_rows = []
-        def ref_callback(r, logits):
-            stats(r, logits)
-            save_reference_row(ref_store, r, logits, ranges[r], conf_rows)
-        backend.run(ids, ref_callback)
+        def ref_callback(r, logits, offset = 0):
+            stats(r, logits, offset)
+            save_reference_row(ref_store, r, logits, ranges[r], conf_rows, offset)
+        backend.run(ids, ref_callback, ranges = ranges)
         save_tensors(os.path.join(ref_store, "conf.safetensors"), {"conf": torch.cat(conf_rows).half()})
         with open(ref_meta, "w") as f:
             json.dump({"rows": ids.shape[0], "ranges": [list(r) for r in ranges]}, f)
@@ -167,7 +167,7 @@ def main(args):
         if floor_results is None:
             backend = open_backend(ref, max_len, device)
             stats = DiffStats(ids, ranges, vocab_size, ref_store)
-            backend.run(ids, stats, noise_eps = BF16_ROUNDING_EPS)
+            backend.run(ids, stats, noise_eps = BF16_ROUNDING_EPS, ranges = ranges)
             floor_results = stats.results()
             floor_results.update(backend.info)
             cache.save_results(floor_results_key, floor_results)
@@ -190,7 +190,7 @@ def main(args):
         if res is None:
             backend = open_backend(mspec, max_len, device)
             stats = DiffStats(ids, ranges, vocab_size, ref_store)
-            backend.run(ids, stats)
+            backend.run(ids, stats, ranges = ranges)
             res = stats.results()
             res.update(backend.info)
             cache.save_results(results_key, res)

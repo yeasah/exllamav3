@@ -239,7 +239,7 @@ class Exl3Backend:
         )
         module.quant_type = "fp16"
 
-    def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
+    def run(self, ids: torch.Tensor, callback, noise_eps: float = None, ranges: list = None):
         from exllamav3.modules import Embedding, Linear
         modules = self.model.modules
         states = list(ids.split(1))
@@ -328,11 +328,17 @@ class Exl3Backend:
                     # Hash-MoE layers (DeepSeek-V4) route by token id; provide the row's ids
                     params = {"input_ids": ids[r:r + 1]}
                     x = module.prepare_for_device(states[r], params)
+                    # The head is position-wise: with score ranges, run it on [a, b) only, so
+                    # its logits scale with the scored span rather than the whole context
+                    offset = 0
+                    if logits_layer and ranges is not None:
+                        offset = ranges[r][0]
+                        x = x[:, ranges[r][0]:ranges[r][1]].contiguous()
                     x = module.forward(x, params)
                     if noise_eps and idx < len(modules) - 2 and x.is_floating_point():
                         x = apply_mult_noise(x, noise_eps, gen)
                     if logits_layer:
-                        callback(r, x)
+                        callback(r, x, offset)
                         states[r] = None
                     else:
                         states[r] = x
@@ -1412,7 +1418,7 @@ class TransformersBackend:
                     sub._parameters[pn] = torch.nn.Parameter(p.to("meta"), requires_grad = False)
 
     @torch.inference_mode()
-    def _run_streaming(self, ids: torch.Tensor, callback, noise_eps: float = None):
+    def _run_streaming(self, ids: torch.Tensor, callback, noise_eps: float = None, ranges: list = None):
         base = self.model.base_model
         layers = self._decoder_layers()
         embed = self.model.get_input_embeddings()
@@ -1549,12 +1555,17 @@ class TransformersBackend:
 
                 self._materialize(head)
                 for r in range(num_rows):
-                    logits = head(hidden_cpu[r].to(self.device))
+                    h = hidden_cpu[r]
+                    offset = 0
+                    if ranges is not None:      # head is position-wise: score range only
+                        offset = ranges[r][0]
+                        h = h[:, ranges[r][0]:ranges[r][1]]
+                    logits = head(h.to(self.device))
                     if self.logit_multiplier != 1.0:
                         logits = logits * self.logit_multiplier
                     if self.logit_softcap:
                         logits = torch.tanh(logits / self.logit_softcap) * self.logit_softcap
-                    callback(r, logits)
+                    callback(r, logits, offset)
                     hidden_cpu[r] = None
                 self._dematerialize(head)
                 pb.update(len(hook_modules) + 1)
@@ -1563,9 +1574,9 @@ class TransformersBackend:
                 h.remove()
 
     @torch.inference_mode()
-    def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
+    def run(self, ids: torch.Tensor, callback, noise_eps: float = None, ranges: list = None):
         if self.streaming:
-            return self._run_streaming(ids, callback, noise_eps)
+            return self._run_streaming(ids, callback, noise_eps, ranges)
         hooks = self._noise_hooks(noise_eps) if noise_eps else []
         try:
             with ProgressBar("Evaluating", ids.shape[0]) as pb:
@@ -1726,7 +1737,7 @@ class LlamaCppBackend:
             main_gpu = options.get("main_gpu", 0),
         )
 
-    def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
+    def run(self, ids: torch.Tensor, callback, noise_eps: float = None, ranges: list = None):
         assert not noise_eps, "Noise injection not supported for llamacpp engine"
         with ProgressBar("Evaluating", ids.shape[0]) as pb:
             for r in range(ids.shape[0]):
@@ -2348,7 +2359,7 @@ class VllmBackend:
                     os.environ[k] = v
         self.vocab_size = self.llm.llm_engine.model_config.get_vocab_size()
 
-    def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
+    def run(self, ids: torch.Tensor, callback, noise_eps: float = None, ranges: list = None):
         assert not noise_eps, "Noise injection not supported for the vllm engine"
         from vllm import SamplingParams
 
