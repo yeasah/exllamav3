@@ -242,7 +242,15 @@ class Exl3Backend:
     def run(self, ids: torch.Tensor, callback, noise_eps: float = None, ranges: list = None):
         from exllamav3.modules import Embedding, Linear
         modules = self.model.modules
-        states = list(ids.split(1))
+        # Trim each row to the end of its score range: trailing padding is causally inert for
+        # every scored position, and on trace rows of very different lengths it is most of the
+        # memory (40 agent rows padded to 17.5k tokens carried ~7 GB of states)
+        row_ids = [ids[r:r + 1, :ranges[r][1]] if ranges is not None else ids[r:r + 1] for r in range(ids.shape[0])]
+        states = list(row_ids)
+        # Inter-module states move to host memory when they would crowd the device; decided once,
+        # from the real size after the first module, against QBENCH_STATE_BUDGET_GB (default 3)
+        state_budget = float(os.environ.get("QBENCH_STATE_BUDGET_GB", "3")) * 2 ** 30
+        offload_states = None
         gen = torch.Generator(device = self.device)
         gen.manual_seed(1)
 
@@ -326,7 +334,7 @@ class Exl3Backend:
                 logits_layer = idx == len(modules) - 1
                 for r in range(len(states)):
                     # Hash-MoE layers (DeepSeek-V4) route by token id; provide the row's ids
-                    params = {"input_ids": ids[r:r + 1]}
+                    params = {"input_ids": row_ids[r]}
                     x = module.prepare_for_device(states[r], params)
                     # The head is position-wise: with score ranges, run it on [a, b) only, so
                     # its logits scale with the scored span rather than the whole context
@@ -341,9 +349,16 @@ class Exl3Backend:
                         callback(r, x, offset)
                         states[r] = None
                     else:
-                        states[r] = x
+                        states[r] = x.cpu() if offload_states else x
                     del x
 
+                if offload_states is None and not logits_layer and states[0] is not None and states[0].is_floating_point():
+                    total = sum(t.numel() * t.element_size() for t in states)
+                    offload_states = total > state_budget
+                    if offload_states:
+                        print(f" -- qbench: {total / 2**30:.1f} GiB of row states exceeds the "
+                              f"{state_budget / 2**30:.1f} GiB budget; keeping them in host memory between modules")
+                        states = [t.cpu() for t in states]
                 module.unload()
                 self.config.stc.close()
                 free_mem()
