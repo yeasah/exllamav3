@@ -22,7 +22,11 @@ Eval mode writes one qbench-compatible trace per slice (<out_prefix>_<slice>.jso
 only the response positions -- in use the model reads a document, it never predicts one:
 
     python ctx_trace.py -m <model_dir> [model_init options] -o <out_prefix> --docs eval \\
-        --code_glob '<repo>/**/*.py' --slices ctx_user,ctx_tool,ctx_ml,loop,self
+        --code_glob '<repo>/**/*.py' --slices ctx_user,ctx_tool,ctx_ml,loop,self,wild
+
+Eval conversations use a scaffolding pool disjoint from calibration's (anchors, tool names and
+schemas, task wording) and vary the thinking settings per conversation; `wild` takes real first
+user turns from WildChat-1M, stratified by language and length, and is eval-only.
 
 Calibration mode packs a --cal_data file for convert.py: raw rows from the bundled default mix,
 random-token rows, and packed conversational streams, in the proportions given by --shares:
@@ -90,6 +94,74 @@ LOOP_TASKS = [
     "Research this for me using your tools, then write up what you found in a few paragraphs.",
     "Check these sources one at a time and tell me how they relate to each other.",
 ]
+
+# --- scaffolding pools -------------------------------------------------------------------------
+# The constants above are the calibration pool. Eval traces use a disjoint pool below -- other
+# phrasings, other tool names, argument names and descriptions, other task wording -- so an eval
+# gain cannot come from fitting calibration's scaffolding. use_pool() rebinds the module names.
+
+CAL_POOL = dict(ANCHORS = ANCHORS, ML_ANCHORS = ML_ANCHORS, ML_ANCHORS_EN = ML_ANCHORS_EN, TOOLS = TOOLS,
+                TOOL_FOR = TOOL_FOR, TOOL_TASKS = TOOL_TASKS, LOOP_TASKS = LOOP_TASKS,
+                TOOL_ARG = {"read_file": "path", "fetch_url": "url", "search": "query"})
+
+EVAL_POOL = dict(
+    ANCHORS = {
+        "web": ["tl;dr?", "Can you break down what this piece is saying?", "Is this accurate? What's the gist?",
+                "I don't have time to read this - what do I need to know?", "What's the angle of this article?"],
+        "wiki": ["Give me the short version of this.", "What's notable here?", "Turn this into a few bullet points.",
+                 "What would someone find surprising in this?", "Explain the background to this."],
+        "technical": ["What does this say, in plain terms?", "Walk me through this.", "What should I take away from this?",
+                      "Which part of this matters most in practice?", "Rewrite this as short instructions."],
+        "code": ["Can you explain this code?", "Any problems with this?", "What would you change here?",
+                 "What is the purpose of this module?", "Where would a bug most likely hide in this?"],
+    },
+    ML_ANCHORS = {
+        "zh": ["这篇讲了什么？", "帮我概括一下重点。"], "ja": ["これは何について書かれていますか？", "ポイントを箇条書きにしてください。"],
+        "ko": ["이 글은 무엇에 관한 건가요?", "핵심만 짧게 정리해 주세요."], "es": ["¿De qué trata esto?", "Hazme un resumen breve."],
+        "fr": ["De quoi parle ce texte ?", "Fais-moi un résumé rapide."], "de": ["Worum geht es hier?", "Gib mir eine kurze Zusammenfassung."],
+        "ru": ["О чём этот текст?", "Выдели главное в нескольких пунктах."], "pt": ["Sobre o que é este texto?", "Me dê um resumo rápido."],
+        "it": ["Di cosa parla questo testo?", "Fammi un breve riassunto."], "ar": ["عمّ يتحدث هذا النص؟", "أعطني ملخصًا سريعًا."],
+        "hi": ["यह लेख किस बारे में है?", "मुख्य बातें संक्षेप में बताइए।"], "tr": ["Bu yazı ne hakkında?", "Kısaca özetler misin?"],
+        "vi": ["Bài này nói về điều gì?", "Tóm tắt nhanh giúp tôi."],
+    },
+    ML_ANCHORS_EN = ["Give me an English summary of this.", "I can't read this language - what does it say?"],
+    TOOLS = [
+        {"type": "function", "function": {"name": "open_document", "description": "Open a document from the user's files and return its contents.",
+            "parameters": {"type": "object", "properties": {"filename": {"type": "string", "description": "Name of the file"}}, "required": ["filename"]}}},
+        {"type": "function", "function": {"name": "browse", "description": "Load a URL in a headless browser and return the page text.",
+            "parameters": {"type": "object", "properties": {"link": {"type": "string", "description": "Address to load"}}, "required": ["link"]}}},
+        {"type": "function", "function": {"name": "kb_lookup", "description": "Look up a topic in the knowledge base.",
+            "parameters": {"type": "object", "properties": {"topic": {"type": "string", "description": "Topic name"}}, "required": ["topic"]}}},
+    ],
+    TOOL_FOR = {"code": "open_document", "web": "browse", "technical": "browse", "wiki": "kb_lookup", "ml": "kb_lookup"},
+    TOOL_TASKS = {
+        "code": ["Open {ref} - what's going on in there?", "I think {ref} has an issue, can you check?"],
+        "web": ["What's on {ref}?", "Pull up {ref} and summarize."],
+        "technical": ["Pull up {ref} and walk me through it.", "What does {ref} cover?"],
+        "wiki": ["What do we know about {ref}?", "Background on {ref}, please."],
+        "ml": ["What do we know about {ref}?", "Background on {ref}, please."],
+    },
+    LOOP_TASKS = [
+        "Go through these and tell me what I should know from each.",
+        "Pull these up and write me a short briefing that covers all of them.",
+        "Look at each of these, then tell me which one matters most and why.",
+    ],
+    TOOL_ARG = {"open_document": "filename", "browse": "link", "kb_lookup": "topic"},
+)
+TOOL_ARG = CAL_POOL["TOOL_ARG"]
+
+# Eval conversations vary the template settings calibration fixes (thinking medium)
+EVAL_TEMPLATE_VARIANTS = [{"enable_thinking": True, "reasoning_effort": "low"},
+                          {"enable_thinking": True, "reasoning_effort": "medium"},
+                          {"enable_thinking": True, "reasoning_effort": "xhigh"},
+                          {"enable_thinking": False}]
+
+def use_pool(purpose):
+    global ANCHORS, ML_ANCHORS, ML_ANCHORS_EN, TOOLS, TOOL_FOR, TOOL_TASKS, LOOP_TASKS, TOOL_ARG
+    P = EVAL_POOL if purpose == "eval" else CAL_POOL
+    ANCHORS, ML_ANCHORS, ML_ANCHORS_EN, TOOLS = P["ANCHORS"], P["ML_ANCHORS"], P["ML_ANCHORS_EN"], P["TOOLS"]
+    TOOL_FOR, TOOL_TASKS, LOOP_TASKS, TOOL_ARG = P["TOOL_FOR"], P["TOOL_TASKS"], P["LOOP_TASKS"], P["TOOL_ARG"]
+
 
 CAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exllamav3", "conversion", "standard_cal_data")
 
@@ -196,6 +268,66 @@ def load_docs(kind, purpose, n, tokenizer, rng, lo, hi, code_glob = None):
     return docs
 
 
+WILD_LANG = {"English": "en", "Chinese": "zh", "Russian": "ru", "French": "fr", "Korean": "ko", "Spanish": "es",
+             "Italian": "it", "Turkish": "tr", "German": "de", "Japanese": "ja", "Portuguese": "pt", "Arabic": "ar",
+             "Hindi": "hi", "Vietnamese": "vi"}
+
+def load_wildchat(n, rng, long_frac = 0.5, shares = None):
+    """First user turns from WildChat-1M (ODC-BY; eval only, never calibration), deduplicated,
+    non-toxic and unredacted, stratified by language and by length: 'long' turns carry pasted
+    material (1500-24000 chars), 'short' ones are ordinary requests (80-1500). Only the user text
+    is kept -- no metadata leaves this function."""
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfFileSystem
+    shares = shares or {"en": 0.45, "zh": 0.15, "ru": 0.07}
+    rest = [l for l in WILD_LANG.values() if l not in shares]
+    left = max(0.0, 1.0 - sum(shares.values()))
+    shares = dict(shares, **{l: left / len(rest) for l in rest})
+    want = {}
+    for kind, frac in (("long", long_frac), ("short", 1 - long_frac)):
+        for l, sh in shares.items():
+            want[(l, kind)] = int(round(n * frac * sh))
+    fs = HfFileSystem()
+    files = sorted(fs.ls("datasets/allenai/WildChat-1M/data", detail = False), reverse = True)   # end of the dataset
+    got, seen = {k: [] for k in want}, set()
+    for f in files:
+        pf = pq.ParquetFile(fs.open(f))
+        for rg in range(pf.num_row_groups):
+            for r in pf.read_row_group(rg, columns = ["conversation", "language", "toxic", "redacted"]).to_pylist():
+                if r["toxic"] or r["redacted"] or not r["conversation"]:
+                    continue
+                first = r["conversation"][0]
+                if first.get("role") != "user" or first.get("toxic") or first.get("redacted"):
+                    continue
+                lang = WILD_LANG.get(r["language"])
+                text = first["content"] or ""
+                kind = "long" if 1500 <= len(text) <= 24000 else "short" if 80 <= len(text) < 1500 else None
+                if not lang or not kind:
+                    continue
+                key = " ".join(text.lower().split())[:160]
+                if key in seen:
+                    continue
+                seen.add(key)
+                if len(got[(lang, kind)]) < want[(lang, kind)] * 3:        # oversample, then draw
+                    got[(lang, kind)].append(text)
+            if all(len(got[k]) >= want[k] * 3 for k in want):
+                break
+        else:
+            continue
+        break
+    out = []
+    for (lang, kind), k in want.items():
+        pool = got[(lang, kind)]
+        take = rng.sample(pool, min(k, len(pool)))
+        out += [{"lang": lang, "kind": kind, "text": t} for t in take]
+        short = k - len(take)
+        if short > 0:                                                         # fill from English
+            extra = [t for t in got[("en", kind)] if t not in [o["text"] for o in out]]
+            out += [{"lang": "en", "kind": kind, "text": t, "fill_for": lang} for t in rng.sample(extra, min(short, len(extra)))]
+    rng.shuffle(out)
+    return out[:n]
+
+
 # --- conversation builders: return (messages, tools) ready for generation ------------------------
 
 def anchor_for(doc, rng):
@@ -209,7 +341,7 @@ def conv_ctx_user(doc, rng):
     return [{"role": "user", "content": content}], None
 
 def tool_call(name, arg_value, call_id):
-    key = {"read_file": "path", "fetch_url": "url", "search": "query"}[name]
+    key = TOOL_ARG[name]
     return {"role": "assistant", "content": "",
             "tool_calls": [{"id": call_id, "type": "function", "function": {"name": name, "arguments": {key: arg_value}}}]}
 
@@ -251,7 +383,7 @@ def generate(generator, config, tokenizer, convs, template_vars, max_new_tokens,
     """convs: list of (meta, messages, tools). Returns trace rows."""
     pending = {}
     for i, (meta, msgs, tools) in enumerate(convs):
-        kw = dict(template_vars, **({"tools": tools} if tools else {}))
+        kw = dict(meta.get("template_vars") or template_vars, **({"tools": tools} if tools else {}))
         input_ids = tokenizer.hf_chat_template(msgs, add_generation_prompt = True, **kw)
         generator.enqueue(Job(input_ids = input_ids, max_new_tokens = max_new_tokens,
                               stop_conditions = config.eos_token_id_list, decode_special_tokens = True,
@@ -292,6 +424,10 @@ def build_convs(sl, n, docs, loop_docs, rng, self_pool):
             take = [pool.pop() for _ in range(rng.randint(2, 3))]
             convs.append(({"slice": sl, "kind": "+".join(d["kind"] for d in take), "lang": "+".join(d["lang"] for d in take),
                            "ref": [d["ref"] for d in take]}, *conv_loop(take, rng)))
+    elif sl == "wild":
+        for w in load_wildchat(n, rng):
+            convs.append(({"slice": sl, "kind": w["kind"], "lang": w["lang"]},
+                          [{"role": "user", "content": w["text"]}], None))
     elif sl == "self":
         for c in rng.sample(self_pool, min(n, len(self_pool))):
             convs.append(({"slice": sl, "kind": "self", "conversation": c},
@@ -306,8 +442,20 @@ def main(args):
     tv = probe_template_vars(tokenizer, dict(DEFAULT_TEMPLATE_VARS, **args.template_vars))
     rng = random.Random(args.seed)
     purpose = args.docs
+    use_pool(purpose)
+    variants = []
+    for v in EVAL_TEMPLATE_VARIANTS:
+        try:
+            tokenizer.hf_chat_template([{"role": "user", "content": "hi"}], add_generation_prompt = True, **v)
+            variants.append(v)
+        except Exception:
+            print(f" !! Chat template rejects {v}; dropped from eval variants")
     lo, hi = args.doc_min, args.doc_max
     self_pool = list(range(len(CONVERSATIONS)))
+    if args.self_from:
+        keep = {r["conversation"] for r in json.load(open(args.self_from))["rows"]}
+        self_pool = [c for c in self_pool if c in keep]
+        print(f" -- own-voice prompts restricted to the {len(self_pool)} used by {args.self_from}")
     if args.exclude_self:
         used = {r["conversation"] for r in json.load(open(args.exclude_self))["rows"]}
         self_pool = [c for c in self_pool if c not in used]
@@ -331,6 +479,9 @@ def main(args):
             rng.shuffle(loop_docs)
         for sl in slices:
             convs = build_convs(sl, n, docs, loop_docs, rng, self_pool)
+            if variants and not args.fixed_template:
+                for meta, _, _ in convs:
+                    meta["template_vars"] = rng.choice(variants)
             print(f" -- slice {sl}: {len(convs)} conversations", flush = True)
             rows = generate(generator, config, tokenizer, convs, tv, args.max_new_tokens, f"{args.seed}|{sl}")
             write_trace(f"{args.output}_{sl}.json", args, tokenizer, tv, rows, {"slice": sl, "docs": purpose})
@@ -406,7 +557,7 @@ def main(args):
     assert out.shape == (R, C), out.shape
     save_file({"input_ids": out.contiguous()}, args.cal_out)
     json.dump({"shares": shares, "ml_frac": args.ml_frac, "composition": comp, "source_trace": f"{args.output}_cal.json"},
-              open(os.path.splitext(args.cal_out)[0] + ".json", "w"), indent = 1)
+              open(os.path.splitext(args.cal_out)[0] + ".manifest.json", "w"), indent = 1)
     print(f" -- {R} x {C} calibration rows -> {args.cal_out}; composition {comp}")
 
 
@@ -426,7 +577,7 @@ if __name__ == "__main__":
     model_init.add_args(parser, default_cache_size = 65536)
     parser.add_argument("-o", "--output", type = str, required = True, help = "Output prefix; writes <prefix>_<slice>.json")
     parser.add_argument("--docs", type = str, default = "eval", choices = ["eval", "cal"], help = "Document sources: held-out eval text, or the calibration corpus")
-    parser.add_argument("--slices", type = str, default = "ctx_user,ctx_tool,ctx_ml,loop,self", help = "(eval) slices to write")
+    parser.add_argument("--slices", type = str, default = "ctx_user,ctx_tool,ctx_ml,loop,self,wild", help = "(eval) slices to write")
     parser.add_argument("--code_glob", type = str, default = None, help = "(eval) glob of source files for code documents")
     parser.add_argument("-n", type = int, default = 30, help = "(eval) conversations per slice")
     parser.add_argument("--cal_out", type = str, default = None, help = "(cal) packed calibration file for convert.py --cal_data")
@@ -436,11 +587,13 @@ if __name__ == "__main__":
                         help = "(cal) row shares per slice, JSON")
     parser.add_argument("--ml_frac", type = float, default = 0.12, help = "(cal) fraction of documents drawn from non-English Wikipedia")
     parser.add_argument("--exclude_self", type = str, default = None, help = "Eval self-slice trace whose own-voice prompts must not be reused")
+    parser.add_argument("--self_from", type = str, default = None, help = "Restrict own-voice prompts to those in this trace (e.g. the set calibration excluded)")
     parser.add_argument("--doc_min", type = int, default = 500, help = "Min document tokens")
     parser.add_argument("--doc_max", type = int, default = 1500, help = "Max document tokens")
     parser.add_argument("--max_new_tokens", type = int, default = 1536)
     parser.add_argument("--seed", type = int, default = 0)
     parser.add_argument("-tv", "--template_vars", type = json.loads, default = {})
+    parser.add_argument("--fixed_template", action = "store_true", help = "(eval) use --template_vars for every conversation instead of varying thinking settings")
     args = parser.parse_args()
     assert args.docs != "cal" or args.cal_out, "--docs cal needs --cal_out"
     main(args)
