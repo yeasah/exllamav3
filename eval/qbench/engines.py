@@ -1461,6 +1461,11 @@ class TransformersBackend:
         nz = ids != 0
         row_len = (ids.shape[1] - nz.flip(1).int().argmax(dim = 1)) * nz.any(dim = 1).int()
         row_len = row_len.clamp(min = 1).tolist()
+        # Inferring length from the last nonzero id mistakes a genuine trailing token 0 for
+        # padding (in Qwen's vocab id 0 is "!"), truncating the row below its score range.
+        # The score range's end is authoritative where we have it
+        if ranges is not None:
+            row_len = [max(n, rng[1]) for n, rng in zip(row_len, ranges)]
         num_rows = ids.shape[0]
 
         pb_state = {"n": 0}
