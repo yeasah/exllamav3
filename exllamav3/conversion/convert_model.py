@@ -430,7 +430,7 @@ def get_state_error(x, ref):
 
 def make_quant_args(args, idx, K, devices, device_ratios = None):
     quant_args = {
-        "seed": idx,
+        "seed": idx + int(os.environ.get("EXL3_SEED_IDX_OFFSET", "0")),
         "K": K,
         "devices": devices,
         "device_ratios": device_ratios,
