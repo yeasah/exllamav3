@@ -647,11 +647,12 @@ def fallback_quant(
     main_stream = get_quant_stream(devices[0])
     with torch.cuda.stream(main_stream):
 
+        # Compute on the first device; the work buffers stay wherever the weight is, which is
+        # the CPU for tensors quantize_exl3 moves off the GPU (e.g. a large-vocab head)
         devices = quant_args["devices"]
-        device = weight.device
-        assert device == torch.device(devices[0])
-
+        device = torch.device(devices[0])
         buffer_device = weight.device
+        assert buffer_device == device or buffer_device.type == "cpu"
         size_k, size_n = weight.shape  # Row-major
         assert size_k % 16 == 0
         assert size_n % 128 == 0
