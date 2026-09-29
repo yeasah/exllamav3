@@ -83,6 +83,7 @@ parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitra
 parser.add_argument("-ngb", "--ngram_bits", type = int, default = None, help = "Bits per weight for hashed n-gram embedding tables, 1-8, default: --bits rounded")
 parser.add_argument("-ngf", "--ngram_file", type = str, default = None, help = "Pre-quantized n-gram table file (from util/convert_ngram.py) to use instead of quantizing the table")
 parser.add_argument("-r", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
+parser.add_argument("-uc", "--uncalibrated", action = "store_true", help = "Quantize every layer without calibration (identity Hessian, as for MTP heads), e.g. for a calibration-neutral reference")
 parser.add_argument("-cd", "--cal_data", type = str, default = None, help = "Calibration data file (safetensors with packed token rows, e.g. from sc_trace.py) used instead of the bundled corpus mix")
 parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 250")
 parser.add_argument("-cc", "--cal_cols", type = int, help = "Calibration data size, columns, default: 2048")
@@ -291,6 +292,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("hq", False, False),
         ("ngram_bits", False, 0),  # 0 = auto: --bits rounded
         ("ngram_file", False, ""),
+        ("uncalibrated", False, False),
         ("cal_data", False, ""),
         ("cal_rows", False, 250),
         ("cal_cols", False, 2048),
@@ -358,7 +360,7 @@ def get_base_model(args):
     print(f" -- Loaded model config")
     print(f"    Architecture: {config.architecture}")
     model = Model.from_config(config)
-    use_reference_state = not model.caps.get("uncalibrated_quantize", False)
+    use_reference_state = not (model.caps.get("uncalibrated_quantize", False) or args.get("uncalibrated", False))
     assert model.caps.get("can_quantize", True), "Cannot quantize this model type."
     print(f" -- Created model instance:")
     print(model.get_layout_tree(4))
