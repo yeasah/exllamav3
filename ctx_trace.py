@@ -9,7 +9,7 @@ import zlib
 import torch
 from safetensors.torch import save_file
 
-from exllamav3 import Generator, Job, model_init
+from exllamav3 import Config, Generator, Job, Tokenizer, model_init
 from eval.qbench_prompts import DEFAULT_TEMPLATE_VARS
 from sc_trace import CONVERSATIONS
 
@@ -499,8 +499,14 @@ def build_convs(sl, n, docs, loop_docs, rng, self_pool):
 
 @torch.inference_mode()
 def main(args):
-    model, config, cache, tokenizer = model_init.init(args)[:4]
-    generator = Generator(model = model, cache = cache, tokenizer = tokenizer, max_chunk_size = 2048)
+    if args.repack:
+        # Tokenizer only: the conversations are rebuilt to replay the original run's RNG state,
+        # and their responses come from the trace instead of the model
+        config = Config.from_directory(args.model_dir)
+        tokenizer, generator = Tokenizer.from_config(config), None
+    else:
+        model, config, cache, tokenizer = model_init.init(args)[:4]
+        generator = Generator(model = model, cache = cache, tokenizer = tokenizer, max_chunk_size = 2048)
     tv = probe_template_vars(tokenizer, dict(DEFAULT_TEMPLATE_VARS, **args.template_vars))
     rng = random.Random(args.seed)
     purpose = args.docs
@@ -552,25 +558,37 @@ def main(args):
         return
 
     # --- calibration: packed mix ---
+    # --repack reuses an earlier pack's trace: the conversations are rebuilt with the shares and
+    # ml_frac that generated it (which replays the original RNG state and is checked against the
+    # trace's input ids), then packed at the new --shares. Generation over-provisions every slice,
+    # so shrinking one draws on spare material; growing one past it falls back to raw rows, loudly
+    src = json.load(open(args.repack)) if args.repack else None
     shares = dict(args.shares)
     assert abs(sum(shares.values()) - 1.0) < 1e-6, f"--shares must sum to 1, got {sum(shares.values())}"
-    R, C = args.cal_rows, args.cal_cols
-    rows_for = {k: int(round(v * R)) for k, v in shares.items()}
-    rows_for["raw"] += R - sum(rows_for.values())                      # rounding remainder
+    gen_shares = dict(src["shares"]) if src else shares
+    ml_frac = src["ml_frac"] if src else args.ml_frac
+    assert not src or args.ml_frac == ml_frac, \
+        f"--repack cannot change ml_frac ({src['ml_frac']} in {args.repack}); the documents are fixed by the trace"
+    R, C = (src.get("cal_rows", args.cal_rows), src.get("cal_cols", args.cal_cols)) if src else (args.cal_rows, args.cal_cols)
+    def plan(sh, R):
+        rf = {k: int(round(v * R)) for k, v in sh.items()}
+        rf["raw"] += R - sum(rf.values())                               # rounding remainder
+        return rf
+    rows_for = plan(gen_shares, R)
     tok_budget = {k: rows_for[k] * C for k in ("ctx", "loop", "self")}
-    print(f" -- calibration rows per slice: {rows_for}")
+    print(f" -- calibration rows per slice: {rows_for}" + (f" (as generated; repacking from {args.repack})" if src else ""))
 
     # Documents: English prose/code kinds plus multilingual Wikipedia, ml_frac of the document slices
     kinds = ["web", "wiki", "technical", "code"]
     avg_ctx, avg_loop = 1300 + 450, 2 * 750 + 500                        # rough tokens per conversation
     n_ctx = int(tok_budget["ctx"] / avg_ctx * 1.25) + 1
     n_loop = int(tok_budget["loop"] / avg_loop * 1.25) + 1
-    n_ml = int(round(args.ml_frac * n_ctx))
+    n_ml = int(round(ml_frac * n_ctx))
     ctx_docs = [d for k in kinds for d in load_docs(k, purpose, -(-(n_ctx - n_ml) // len(kinds)), tokenizer, rng, lo, hi)]
     ctx_docs += load_docs("ml", purpose, n_ml, tokenizer, rng, lo, hi)
     rng.shuffle(ctx_docs)
     n_loop_docs = n_loop * 3
-    n_loop_ml = int(round(args.ml_frac * n_loop_docs))
+    n_loop_ml = int(round(ml_frac * n_loop_docs))
     loop_docs = [d for k in kinds for d in load_docs(k, purpose, -(-(n_loop_docs - n_loop_ml) // len(kinds)), tokenizer, rng, lo // 2, hi // 2)]
     loop_docs += load_docs("ml", purpose, n_loop_ml, tokenizer, rng, lo // 2, hi // 2)
     rng.shuffle(loop_docs)
@@ -583,9 +601,24 @@ def main(args):
     convs += build_convs("loop", n_loop, {}, loop_docs, rng, self_pool)
     n_self = int(tok_budget["self"] / 1400 * 1.25) + 1
     convs += build_convs("self", n_self, {}, [], rng, self_pool)
-    print(f" -- generating {len(convs)} conversations", flush = True)
-    rows = generate(generator, config, tokenizer, convs, tv, args.max_new_tokens, f"{args.seed}|cal")
-    write_trace(f"{args.output}_cal.json", args, tokenizer, tv, rows, {"slice": "cal", "docs": purpose})
+    if src:
+        source_trace = src["source_trace"]
+        rows = json.load(open(source_trace))["rows"]
+        assert len(rows) == len(convs), \
+            f"{source_trace} has {len(rows)} conversations, the replay built {len(convs)}: different settings than generated it"
+        for i, ((meta, msgs, tools), r) in enumerate(zip(convs, rows)):
+            kw = dict(tv, **({"tools": tools} if tools else {}))
+            ids = tokenizer.hf_chat_template(msgs, add_generation_prompt = True, **kw)[0].tolist()
+            assert ids == r["input_ids"] and meta["slice"] == r["slice"], \
+                f"conversation {i} does not match {source_trace}: the replay needs the original -m, -tv, --seed, --exclude_self and doc bounds"
+        print(f" -- replayed {len(convs)} conversations, all matching {source_trace}")
+        rows_for = plan(shares, R)
+        print(f" -- repacked rows per slice: {rows_for}")
+    else:
+        print(f" -- generating {len(convs)} conversations", flush = True)
+        rows = generate(generator, config, tokenizer, convs, tv, args.max_new_tokens, f"{args.seed}|cal")
+        source_trace = f"{args.output}_cal.json"
+        write_trace(source_trace, args, tokenizer, tv, rows, {"slice": "cal", "docs": purpose})
 
     # Pack: each conversational slice's streams into fixed-width rows, up to its row budget
     from exllamav3.conversion.calibration_data import get_default_calibration
@@ -620,7 +653,9 @@ def main(args):
     out = torch.cat([packed[i] for i in order], dim = 0)
     assert out.shape == (R, C), out.shape
     save_file({"input_ids": out.contiguous()}, args.cal_out)
-    json.dump({"shares": shares, "ml_frac": args.ml_frac, "composition": comp, "source_trace": f"{args.output}_cal.json"},
+    json.dump({"shares": gen_shares, "ml_frac": ml_frac, "cal_rows": R, "cal_cols": C, "composition": comp,
+               "source_trace": source_trace,
+               **({"packed_shares": shares, "repacked_from": args.repack} if src else {})},
               open(os.path.splitext(args.cal_out)[0] + ".manifest.json", "w"), indent = 1)
     print(f" -- {R} x {C} calibration rows -> {args.cal_out}; composition {comp}")
 
@@ -649,6 +684,7 @@ if __name__ == "__main__":
     parser.add_argument("--cal_cols", type = int, default = 2048)
     parser.add_argument("--shares", type = json.loads, default = {"raw": 0.25, "ctx": 0.35, "loop": 0.25, "self": 0.10, "random": 0.05},
                         help = "(cal) row shares per slice, JSON")
+    parser.add_argument("--repack", type = str, default = None, help = "(cal) manifest of an earlier pack: reuse its trace instead of generating, packed at --shares (needs the original -m, -tv, --seed and --exclude_self)")
     parser.add_argument("--ml_frac", type = float, default = 0.12, help = "(cal) fraction of documents drawn from non-English Wikipedia")
     parser.add_argument("--exclude_self", type = str, default = None, help = "Eval self-slice trace whose own-voice prompts must not be reused")
     parser.add_argument("--self_from", type = str, default = None, help = "Restrict own-voice prompts to those in this trace (e.g. the set calibration excluded)")
@@ -660,4 +696,5 @@ if __name__ == "__main__":
     parser.add_argument("--fixed_template", action = "store_true", help = "(eval) use --template_vars for every conversation instead of varying thinking settings")
     args = parser.parse_args()
     assert args.docs != "cal" or args.cal_out, "--docs cal needs --cal_out"
+    assert not args.repack or args.docs == "cal", "--repack applies to --docs cal"
     main(args)
