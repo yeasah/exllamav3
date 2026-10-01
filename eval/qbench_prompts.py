@@ -388,6 +388,9 @@ def main(args):
             text_temp = ""
             while generator.num_remaining_jobs():
                 for result in generator.iterate():
+                    # A failed job is an "error" result, not an exception; don't record it as an empty turn
+                    if result["stage"] == "error":
+                        raise RuntimeError("generation failed") from result["error"]
                     if result["stage"] == "streaming" and "token_ids" in result:
                         chunks.append(result["token_ids"])
                         total_temp += result["token_ids"].shape[-1]

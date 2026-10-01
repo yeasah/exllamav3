@@ -672,6 +672,11 @@ def main(args):
                 wave_tokens = 0
                 while generator.num_remaining_jobs():
                     for result in generator.iterate():
+                        # A failed job is an "error" result, not an exception; skipping it would
+                        # read as the conversation ending and silently shrink the corpus
+                        if result["stage"] == "error":
+                            raise RuntimeError(f"generation failed for conversation {result['job'].identifier}") \
+                                from result["error"]
                         if result["stage"] != "streaming":
                             continue
                         p = pending[result["identifier"]]

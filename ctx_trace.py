@@ -444,6 +444,11 @@ def generate(generator, config, tokenizer, convs, template_vars, max_new_tokens,
         pending[i] = {"meta": meta, "input_ids": input_ids, "chunks": [], "eos_reason": None}
     while generator.num_remaining_jobs():
         for r in generator.iterate():
+            # A failed job comes back as an "error" result, not an exception; skipping it would
+            # silently drop the conversation (a poisoned CUDA context fails every job, and the
+            # trace comes out empty with exit 0)
+            if r["stage"] == "error":
+                raise RuntimeError(f"generation failed for conversation {r['job'].identifier}") from r["error"]
             if r["stage"] != "streaming":
                 continue
             p = pending[r["identifier"]]
