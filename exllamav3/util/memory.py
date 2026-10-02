@@ -68,6 +68,15 @@ def unset_memory_fraction(active_devices: list[int]):
 # Free unused VRAM
 def free_mem():
     gc.collect()
+    # With expandable segments (on by default, __init__.py), empty_cache() unmaps freed pages on every
+    # device but waits only for the current one. A block freed while kernels on another device still
+    # write to it (stream-ordered frees make that legal, e.g. autosplit's reference forward on the last
+    # device) is then unmapped under them: Xid 31 at best, silent corruption if the range is remapped.
+    # PyTorch bug #196258, fixed by pytorch/pytorch@3fda599 (unmapHandles guards the segment's own
+    # device); this sync is removable once the minimum torch release includes that commit
+    if torch.cuda.is_available():
+        for d in range(torch.cuda.device_count()):
+            torch.cuda.synchronize(d)
     torch.cuda.empty_cache()
 
 
