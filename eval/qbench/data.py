@@ -134,16 +134,22 @@ class QCache:
             return {}
 
     def note(self, key: str, info: dict):
-        """Record what a cache key stands for, merging into the existing entry."""
-        man = self._manifest()
-        entry = man.get(key, {})
-        entry.update({k: v for k, v in info.items() if v is not None})
-        entry["seen"] = datetime.datetime.now().isoformat(timespec = "seconds")
-        man[key] = entry
-        tmp = self.manifest_file() + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(man, f, indent = 1, sort_keys = True)
-        os.replace(tmp, self.manifest_file())
+        """Record what a cache key stands for, merging into the existing entry. Several qbench
+        runs can share one cache (one per GPU), so the read-modify-write holds a lock: with a
+        shared temp name a concurrent rename failed outright, and without the lock one run's
+        entries could silently vanish from the manifest, which tools use to find results."""
+        import fcntl
+        with open(self.manifest_file() + ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            man = self._manifest()
+            entry = man.get(key, {})
+            entry.update({k: v for k, v in info.items() if v is not None})
+            entry["seen"] = datetime.datetime.now().isoformat(timespec = "seconds")
+            man[key] = entry
+            tmp = f"{self.manifest_file()}.{os.getpid()}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(man, f, indent = 1, sort_keys = True)
+            os.replace(tmp, self.manifest_file())
 
     def describe(self, key: str) -> dict:
         return self._manifest().get(key, {})
