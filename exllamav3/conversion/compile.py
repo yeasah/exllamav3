@@ -197,13 +197,22 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
         "bits": args["final_bits"],
         "head_bits": args["head_bits"],
     }
-    if "cal_rows" in args:
-        qcfg.update({
-            "calibration": {
-                "rows": args["cal_rows"],
-                "cols": args["cal_cols"],
-            }
-        })
+    # What the Hessians were built from: nothing else in a checkpoint records it
+    if args.get("uncalibrated") or model.caps.get("uncalibrated_quantize", False):
+        qcfg["calibration"] = {"source": "uncalibrated"}
+    elif "cal_rows" in args:
+        calibration = {
+            "source": "file" if args.get("cal_data") else "default",
+            "rows": args["cal_rows"],
+            "cols": args["cal_cols"],
+        }
+        if args.get("cal_data"):
+            calibration["file"] = os.path.basename(args["cal_data"])
+            if args.get("cal_data_sha256"):
+                calibration["sha256"] = args["cal_data_sha256"]
+        qcfg["calibration"] = calibration
+    if args.get("seed_idx_offset"):
+        qcfg["seed_idx_offset"] = args["seed_idx_offset"]
     if "apply_out_scales" in args:
         qcfg.update({
             "out_scales": {True: "always", False: "never", None: "auto"}[args["apply_out_scales"]]

@@ -18,6 +18,7 @@ from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_
 from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
 import json
+import hashlib
 import threading
 from pathlib import Path
 from collections import deque
@@ -314,6 +315,24 @@ def prepare(args) -> (dict, dict, bool, str):
     in_args["apply_out_scales"] = {"always": True, "never": False, "auto": None}[args.out_scales]
     in_args["max_module"] = args.max_module
 
+    # Provenance that quantization_config.json records, fixed at job creation and carried
+    # through resumes: the seed offset (EXL3_SEED_IDX_OFFSET, which selects a different sign and
+    # rounding draw) and the identity of a --cal_data file
+    env_offset = os.environ.get("EXL3_SEED_IDX_OFFSET")
+    if not args.resume:
+        in_args["seed_idx_offset"] = int(env_offset or 0)
+        if in_args.get("cal_data"):
+            h = hashlib.sha256()
+            with open(in_args["cal_data"], "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            in_args["cal_data_sha256"] = h.hexdigest()
+    elif "seed_idx_offset" not in in_args:
+        in_args["seed_idx_offset"] = int(env_offset or 0)   # job created before the offset was recorded
+    elif env_offset is not None and int(env_offset) != in_args["seed_idx_offset"]:
+        raise ValueError(f" ## EXL3_SEED_IDX_OFFSET={env_offset}, but this job was created with "
+                         f"{in_args['seed_idx_offset']}; resuming with another offset would mix two draws")
+
     if args.resume:
         job_state = load_dict("ckpt/job.json", in_args)
         print(f" -- Resuming existing job")
@@ -333,6 +352,8 @@ def prepare(args) -> (dict, dict, bool, str):
     print(f"    Calibration size: {in_args['cal_rows']} rows, {in_args['cal_cols']} columns")
     if in_args.get("cal_data"):
         print(f"    Calibration data: {in_args['cal_data']}")
+    if in_args.get("seed_idx_offset"):
+        print(f"    Seed index offset: {in_args['seed_idx_offset']}")
     print(f"    Target bitrate: {in_args['bits']} (decoder), {in_args['head_bits']} (head)")
     if in_args.get("recipe_strategy"):
         print(f"    Recipe: {in_args.get('recipe')} ({len(in_args['recipe_strategy'])} tensors)")
@@ -432,7 +453,7 @@ def get_state_error(x, ref):
 
 def make_quant_args(args, idx, K, devices, device_ratios = None):
     quant_args = {
-        "seed": idx + int(os.environ.get("EXL3_SEED_IDX_OFFSET", "0")),
+        "seed": idx + args.get("seed_idx_offset", 0),
         "K": K,
         "devices": devices,
         "device_ratios": device_ratios,
