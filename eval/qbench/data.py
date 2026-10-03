@@ -218,6 +218,29 @@ class QCache:
             shutil.rmtree(path)
             total -= size
 
+    def prune(self, unused_since: datetime.datetime, dry_run: bool = False) -> list:
+        """Evict reference logits not used since `unused_since`: the manifest's `seen`, which every
+        run that reads or writes them refreshes. Run after a complete bench series with its start
+        time, it drops whatever that series did not need (logits for a superseded eval trace, a
+        reference no longer scored). Results, KL vectors and tokenized data are never evicted:
+        they are small, and are what rescoring and cards are built from."""
+        man = self._manifest()
+        evicted = []
+        for name in sorted(os.listdir(self.root)):
+            path = os.path.join(self.root, name)
+            if not name.startswith("logits_") or not os.path.isdir(path):
+                continue
+            seen = man.get(name[len("logits_"):], {}).get("seen")
+            if seen and datetime.datetime.fromisoformat(seen) >= unused_since:
+                continue
+            size = sum(os.path.getsize(os.path.join(path, f)) for f in os.listdir(path))
+            print(f" -- Prune: {'would evict' if dry_run else 'evicting'} {name} ({size / 1024**3:.1f} GB, "
+                  f"last used {seen or 'never recorded'})")
+            if not dry_run:
+                shutil.rmtree(path)
+            evicted.append((path, size))
+        return evicted
+
 
 def get_test_rows(project: dict, cache: QCache):
     """
