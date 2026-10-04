@@ -438,8 +438,35 @@ def probe_template_vars(tokenizer, template_vars):
 # pres_p/freq_p count generated tokens only (OpenAI semantics, as model cards assume): Job passes
 # the sampler its generated count.
 SAMPLING = None
+# --sampling_profile: per-conversation sampling. {"source": ..., "modes": {name: {sampler args}},
+# "rules": [{"slice": str | [str], "thinking": bool, "mode": name}, ...]}: the first rule whose given
+# keys all match the conversation (its slice, and whether its chat template has thinking on)
+# picks the mode. Mode args take OpenAI/vLLM names (presence_penalty, ...) or ComboSampler's.
+PROFILE = None
+SAMPLER_KEYS = {"presence_penalty": "pres_p", "frequency_penalty": "freq_p", "repetition_penalty": "rep_p"}
 
-def make_sampler():
+def load_profile(path):
+    with open(path) as f:
+        prof = json.load(f)
+    assert prof.get("modes") and prof.get("rules"), f"{path}: a profile needs modes and rules"
+    for rule in prof["rules"]:
+        assert rule.get("mode") in prof["modes"], f"{path}: rule {rule} names no defined mode"
+    return prof
+
+def sampling_mode(meta, template_kw):
+    thinking = bool(template_kw.get("enable_thinking", True))
+    for rule in PROFILE["rules"]:
+        sl = rule.get("slice")
+        if sl is not None and meta["slice"] not in ([sl] if isinstance(sl, str) else sl):
+            continue
+        if rule.get("thinking") is not None and rule["thinking"] != thinking:
+            continue
+        return rule["mode"]
+    raise ValueError(f"sampling profile has no rule for slice {meta['slice']}, thinking {thinking}")
+
+def make_sampler(mode = None):
+    if mode is not None:
+        return ComboSampler(**{SAMPLER_KEYS.get(k, k): v for k, v in PROFILE["modes"][mode].items()})
     return ComboSampler(**SAMPLING) if SAMPLING is not None else None
 
 def generate(generator, config, tokenizer, convs, template_vars, max_new_tokens, seed):
@@ -448,11 +475,12 @@ def generate(generator, config, tokenizer, convs, template_vars, max_new_tokens,
     for i, (meta, msgs, tools) in enumerate(convs):
         kw = dict(meta.get("template_vars") or template_vars, **({"tools": tools} if tools else {}))
         input_ids = tokenizer.hf_chat_template(msgs, add_generation_prompt = True, **kw)
+        mode = sampling_mode(meta, kw) if PROFILE is not None else None
         generator.enqueue(Job(input_ids = input_ids, max_new_tokens = max_new_tokens,
                               stop_conditions = config.eos_token_id_list, decode_special_tokens = True,
                               identifier = i, seed = zlib.crc32(f"{seed}|{i}".encode()),
-                              sampler = make_sampler()))
-        pending[i] = {"meta": meta, "input_ids": input_ids, "chunks": [], "eos_reason": None}
+                              sampler = make_sampler(mode)))
+        pending[i] = {"meta": meta, "input_ids": input_ids, "chunks": [], "eos_reason": None, "mode": mode}
     while generator.num_remaining_jobs():
         for r in generator.iterate():
             # A failed job comes back as an "error" result, not an exception; skipping it would
@@ -475,6 +503,7 @@ def generate(generator, config, tokenizer, convs, template_vars, max_new_tokens,
         if not p["chunks"]:
             continue
         rows.append({**p["meta"], "eos_reason": p["eos_reason"],
+                     **({"sampling_mode": p["mode"]} if p["mode"] is not None else {}),
                      "input_ids": p["input_ids"][0].tolist(),
                      "response_ids": torch.cat(p["chunks"], dim = -1)[0].tolist()})
     return rows
@@ -673,7 +702,7 @@ def main(args):
 
 def write_trace(path, args, tokenizer, tv, rows, meta):
     out = {"model": args.model_dir, "vocab_size": tokenizer.actual_vocab_size, "template_vars": tv,
-           "sampling": args.sampling or "exllamav3 DefaultSampler (temperature 0.8, min_p 0.08)",
+           "sampling": PROFILE or args.sampling or "exllamav3 DefaultSampler (temperature 0.8, min_p 0.08)",
            "meta": {**meta, "rows": len(rows),
                     "input_tokens": sum(len(r["input_ids"]) for r in rows),
                     "output_tokens": sum(len(r["response_ids"]) for r in rows)},
@@ -708,9 +737,14 @@ if __name__ == "__main__":
     parser.add_argument("--sampling", type = json.loads, default = None,
                         help = "ComboSampler arguments as JSON, e.g. '{\"temperature\": 1.0, \"top_k\": 20, \"top_p\": 0.95}' "
                                "(default: exllamav3's DefaultSampler). pres_p/freq_p count generated tokens only, as in vLLM")
+    parser.add_argument("--sampling_profile", type = str, default = None,
+                        help = "JSON file of sampling modes and the rules that pick one per conversation (slice, thinking); "
+                               "each trace row records its mode")
     parser.add_argument("--fixed_template", action = "store_true", help = "(eval) use --template_vars for every conversation instead of varying thinking settings")
     args = parser.parse_args()
     assert args.docs != "cal" or args.cal_out, "--docs cal needs --cal_out"
     assert not args.repack or args.docs == "cal", "--repack applies to --docs cal"
     SAMPLING = args.sampling
+    assert not (args.sampling and args.sampling_profile), "--sampling and --sampling_profile are exclusive"
+    PROFILE = load_profile(args.sampling_profile) if args.sampling_profile else None
     main(args)
