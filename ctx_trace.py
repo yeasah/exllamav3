@@ -10,6 +10,7 @@ import torch
 from safetensors.torch import save_file
 
 from exllamav3 import Config, Generator, Job, Tokenizer, model_init
+from exllamav3.generator.sampler import ComboSampler
 from eval.qbench_prompts import DEFAULT_TEMPLATE_VARS
 from sc_trace import CONVERSATIONS
 
@@ -432,6 +433,15 @@ def probe_template_vars(tokenizer, template_vars):
             return {}
     return template_vars
 
+# --sampling: exllamav3's own default (temperature 0.8, min-p 0.08) when unset, which is no model's
+# recommendation. Keys are ComboSampler's: temperature, top_k, top_p, min_p, pres_p, freq_p, rep_p.
+# Note exllamav3's pres_p/freq_p count the whole sequence, prompt included; vLLM and the OpenAI API
+# count generated tokens only, which is what model cards' recommended penalties assume.
+SAMPLING = None
+
+def make_sampler():
+    return ComboSampler(**SAMPLING) if SAMPLING is not None else None
+
 def generate(generator, config, tokenizer, convs, template_vars, max_new_tokens, seed):
     """convs: list of (meta, messages, tools). Returns trace rows."""
     pending = {}
@@ -440,7 +450,8 @@ def generate(generator, config, tokenizer, convs, template_vars, max_new_tokens,
         input_ids = tokenizer.hf_chat_template(msgs, add_generation_prompt = True, **kw)
         generator.enqueue(Job(input_ids = input_ids, max_new_tokens = max_new_tokens,
                               stop_conditions = config.eos_token_id_list, decode_special_tokens = True,
-                              identifier = i, seed = zlib.crc32(f"{seed}|{i}".encode())))
+                              identifier = i, seed = zlib.crc32(f"{seed}|{i}".encode()),
+                              sampler = make_sampler()))
         pending[i] = {"meta": meta, "input_ids": input_ids, "chunks": [], "eos_reason": None}
     while generator.num_remaining_jobs():
         for r in generator.iterate():
@@ -662,6 +673,7 @@ def main(args):
 
 def write_trace(path, args, tokenizer, tv, rows, meta):
     out = {"model": args.model_dir, "vocab_size": tokenizer.actual_vocab_size, "template_vars": tv,
+           "sampling": args.sampling or "exllamav3 DefaultSampler (temperature 0.8, min_p 0.08)",
            "meta": {**meta, "rows": len(rows),
                     "input_tokens": sum(len(r["input_ids"]) for r in rows),
                     "output_tokens": sum(len(r["response_ids"]) for r in rows)},
@@ -693,8 +705,12 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type = int, default = 1536)
     parser.add_argument("--seed", type = int, default = 0)
     parser.add_argument("-tv", "--template_vars", type = json.loads, default = {})
+    parser.add_argument("--sampling", type = json.loads, default = None,
+                        help = "ComboSampler arguments as JSON, e.g. '{\"temperature\": 1.0, \"top_k\": 20, \"top_p\": 0.95}' "
+                               "(default: exllamav3's DefaultSampler). pres_p/freq_p count the prompt too, unlike vLLM")
     parser.add_argument("--fixed_template", action = "store_true", help = "(eval) use --template_vars for every conversation instead of varying thinking settings")
     args = parser.parse_args()
     assert args.docs != "cal" or args.cal_out, "--docs cal needs --cal_out"
     assert not args.repack or args.docs == "cal", "--repack applies to --docs cal"
+    SAMPLING = args.sampling
     main(args)
