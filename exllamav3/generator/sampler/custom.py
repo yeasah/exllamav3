@@ -45,6 +45,9 @@ class SamplingState:
     probs: torch.Tensor | None = None
     indices: torch.Tensor | None = None
     past_ids: torch.Tensor | None = None
+    # The generated tail of past_ids, when the caller says how long it is: what OpenAI-style
+    # presence/frequency penalties count (vLLM and the OpenAI API ignore the prompt)
+    generated_ids: torch.Tensor | None = None
     tokenizer: Tokenizer | None = None
     state: SS = SS.INIT
     # Logit mask deferred into the fused kernel (fused-only stacks); fused_dim bounds the vocab
@@ -827,13 +830,23 @@ class SS_PresFreqP(SS_Base):
         self.decay_range = decay_range
 
     def run(self, state: SamplingState):
+        # OpenAI semantics when the caller gave the generated count: the prompt is not penalized,
+        # and neither is anything before the first generated token. Counting the prompt instead
+        # (the old behavior, kept for callers that don't say) penalizes every token of a pasted
+        # document, and drifts as a conversation grows -- each turn adds to the penalized set
+        ids = state.generated_ids if state.generated_ids is not None else state.past_ids
+        if ids.shape[-1] == 0:
+            if state.state == SS.INIT:
+                state.logits = state.in_logits.float()
+            state.state = SS.LOGITS
+            return
         match state.state:
             case SS.INIT:
                 state.logits = torch.empty_like(state.in_logits, dtype = torch.float)
                 ext.apply_pres_freq_pens(
                     state.in_logits,
                     state.logits,
-                    state.past_ids,
+                    ids,
                     self.pres_p,
                     self.freq_p,
                     self.sustain_range,
@@ -843,7 +856,7 @@ class SS_PresFreqP(SS_Base):
                 ext.apply_pres_freq_pens(
                     state.logits,
                     state.logits,
-                    state.past_ids,
+                    ids,
                     self.pres_p,
                     self.freq_p,
                     self.sustain_range,
@@ -1175,8 +1188,12 @@ class CustomSampler(Sampler):
         rand_u32: int | None = None,
         tokenizer: Tokenizer | None = None,
         logit_mask: torch.Tensor | None = None,
-        return_state: bool = False
+        return_state: bool = False,
+        num_generated: int | None = None,
     ):
+        """num_generated: how many trailing tokens of sequence_ids the model generated. Given, the
+        presence/frequency penalties count only those (OpenAI semantics); omitted, they count the
+        whole sequence, as before."""
         out_shape = logits.shape[:-1]
 
         if tokenizer is not None and tokenizer.actual_vocab_size < logits.shape[-1]:
@@ -1239,6 +1256,8 @@ class CustomSampler(Sampler):
             bsz = bsz,
             in_logits = logits.view(bsz, dim),
             past_ids = sequence_ids,
+            generated_ids = (sequence_ids[..., sequence_ids.shape[-1] - num_generated:].contiguous()
+                             if sequence_ids is not None and num_generated is not None else None),
             tokenizer = tokenizer,
             fused_mask = fused_mask,
             fused_dim = fused_dim,

@@ -577,7 +577,10 @@ class Job:
                 self.current_device_ids,
                 self.rng.randint(0, (1<<32)-1),
                 self.generator.tokenizer,
-                logit_mask = self.device_logit_mask
+                logit_mask = self.device_logit_mask,
+                # tokens this job generated, including before a requeue: what presence/frequency
+                # penalties count (token healing's -1 is none)
+                num_generated = max(0, self.rq_new_tokens + self.new_tokens),
             )
 
         next_prob, next_k_tokens, next_k_probs = None, None, None
