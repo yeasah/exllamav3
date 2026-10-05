@@ -335,6 +335,7 @@ SWE_EVAL_GROUPS = ["openhands/minimax_m25/swe-rebench-v2", "sweagent/minimax_m25
 # the same multilingual task pool as eval -- the only pool with more than Python -- with every
 # repository the eval slice uses excluded (--exclude_swe_from)
 SWE_CAL_GROUPS = ["minisweagent/qwen38_27b/swe-rebench-v2"]
+SWE_EXCLUDE = frozenset()                # eval: repositories to skip (--exclude_swe_from)
 
 def load_swe(n, rng, tokenizer, template_vars, cap_tokens = 16000, min_turn = 5, groups = SWE_EVAL_GROUPS,
              min_tokens = 0, exclude_repos = frozenset()):
@@ -538,7 +539,7 @@ def build_convs(sl, n, docs, loop_docs, rng, self_pool):
             convs.append(({"slice": sl, "kind": "+".join(d["kind"] for d in take), "lang": "+".join(d["lang"] for d in take),
                            "ref": [d["ref"] for d in take]}, *conv_loop(take, rng)))
     elif sl == "swe":
-        for w in load_swe(n, rng, SWE_TOKENIZER, SWE_TV):
+        for w in load_swe(n, rng, SWE_TOKENIZER, SWE_TV, exclude_repos = SWE_EXCLUDE):
             convs.append(({"slice": sl, "kind": w["harness"], "lang": "en", "repo": w["repo"], "code_language": w["language"],
                            "instance_id": w["instance_id"], "cut": w["cut"], "resolved": w["resolved"]}, w["messages"], w["tools"]))
     elif sl == "wild":
@@ -566,8 +567,11 @@ def main(args):
     rng = random.Random(args.seed)
     purpose = args.docs
     use_pool(purpose)
-    global SWE_TOKENIZER, SWE_TV
+    global SWE_TOKENIZER, SWE_TV, SWE_EXCLUDE
     SWE_TOKENIZER, SWE_TV = tokenizer, tv
+    if purpose == "eval" and args.exclude_swe_from:      # the other direction: keep a calibration's repositories out of eval
+        with open(args.exclude_swe_from) as f:
+            SWE_EXCLUDE = frozenset(r["repo"] for r in json.load(f)["rows"] if r.get("repo"))
     variants = []
     for v in EVAL_TEMPLATE_VARIANTS:
         try:
@@ -773,7 +777,8 @@ if __name__ == "__main__":
                         help = "(cal) row shares per slice, JSON")
     parser.add_argument("--repack", type = str, default = None, help = "(cal) manifest of an earlier pack: reuse its trace instead of generating, packed at --shares (needs the original -m, -tv, --seed and --exclude_self)")
     parser.add_argument("--exclude_swe_from", type = str, default = None,
-                        help = "(cal) eval swe trace whose repositories the agent slice must not use; required with an agent share")
+                        help = "(cal) eval swe trace whose repositories the agent slice must not use; required with an agent share. "
+                        "(eval) a calibration trace whose agent sessions' repositories the swe slice must not use")
     parser.add_argument("--ml_frac", type = float, default = 0.12, help = "(cal) fraction of documents drawn from non-English Wikipedia")
     parser.add_argument("--exclude_self", type = str, default = None, help = "Eval self-slice trace whose own-voice prompts must not be reused")
     parser.add_argument("--self_from", type = str, default = None, help = "Restrict own-voice prompts to those in this trace (e.g. the set calibration excluded)")
