@@ -51,6 +51,8 @@ ANCHORS = {
                   "What are the key technical points?", "Is anything here unclear or likely to trip people up?"],
     "code": ["What does this code do?", "Review this code for bugs or risky patterns.", "Explain this file to a new contributor.",
              "How would you write tests for this?", "Suggest one refactor that would make this clearer."],
+    "diff": ["Review this patch.", "What do these changes do?", "Is there anything wrong with this diff?",
+             "Write a changelog entry for these commits.", "Which of these changes is riskiest, and why?"],
 }
 
 # Anchors for non-English documents: half in the document's language, half asking for English
@@ -81,10 +83,11 @@ TOOLS = [
     {"type": "function", "function": {"name": "search", "description": "Search an encyclopedia and return the best matching article.",
         "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
 ]
-TOOL_FOR = {"code": "read_file", "web": "fetch_url", "technical": "fetch_url", "wiki": "search", "ml": "search"}
+TOOL_FOR = {"code": "read_file", "diff": "read_file", "web": "fetch_url", "technical": "fetch_url", "wiki": "search", "ml": "search"}
 
 TOOL_TASKS = {
     "code": ["Take a look at {ref} and tell me what it does.", "Is there anything wrong with {ref}?"],
+    "diff": ["Review the changes in {ref}.", "Read {ref} and tell me what these commits change."],
     "web": ["Read {ref} and give me the gist.", "Can you check {ref} and tell me whether it's worth reading?"],
     "technical": ["Read {ref} and explain what it covers.", "Check {ref} and tell me the important parts."],
     "wiki": ["Look up {ref} and give me a short overview.", "Find out about {ref} and tell me the key facts."],
@@ -116,6 +119,8 @@ EVAL_POOL = dict(
                       "Which part of this matters most in practice?", "Rewrite this as short instructions."],
         "code": ["Can you explain this code?", "Any problems with this?", "What would you change here?",
                  "What is the purpose of this module?", "Where would a bug most likely hide in this?"],
+        "diff": ["Can you sanity-check this change?", "Summarize what changed here.", "Would you merge this? Why or why not?",
+                 "What did these commits fix?", "Anything in this diff that looks like a regression?"],
     },
     ML_ANCHORS = {
         "zh": ["这篇讲了什么？", "帮我概括一下重点。"], "ja": ["これは何について書かれていますか？", "ポイントを箇条書きにしてください。"],
@@ -135,9 +140,10 @@ EVAL_POOL = dict(
         {"type": "function", "function": {"name": "kb_lookup", "description": "Look up a topic in the knowledge base.",
             "parameters": {"type": "object", "properties": {"topic": {"type": "string", "description": "Topic name"}}, "required": ["topic"]}}},
     ],
-    TOOL_FOR = {"code": "open_document", "web": "browse", "technical": "browse", "wiki": "kb_lookup", "ml": "kb_lookup"},
+    TOOL_FOR = {"code": "open_document", "diff": "open_document", "web": "browse", "technical": "browse", "wiki": "kb_lookup", "ml": "kb_lookup"},
     TOOL_TASKS = {
         "code": ["Open {ref} - what's going on in there?", "I think {ref} has an issue, can you check?"],
+        "diff": ["Open {ref} and tell me if these changes look right.", "What does the patch in {ref} do?"],
         "web": ["What's on {ref}?", "Pull up {ref} and summarize."],
         "technical": ["Pull up {ref} and walk me through it.", "What does {ref} cover?"],
         "wiki": ["What do we know about {ref}?", "Background on {ref}, please."],
@@ -206,9 +212,61 @@ def wiki_rowgroup(lang, rg, min_chars = 3000):
         t = pq.ParquetFile(f).read_row_group(rg, columns = ["title", "text"]).to_pylist()
     return [(r["title"], r["text"]) for r in t if len(r["text"]) >= min_chars]
 
+# diff documents: real commits from CommitPackFT (MIT; each sample from a permissively licensed
+# repository, kept only where its license field says so), rendered as `git log -p` shows them,
+# a few commits of one language per document. Calibration and eval take disjoint repositories.
+DIFF_LANGS = ["python", "javascript", "typescript", "c", "c++", "go", "rust", "java", "shell", "c#", "ruby", "php",
+              "kotlin", "swift", "scala", "lua", "haskell", "r", "yaml", "json", "markdown", "html", "css", "sql",
+              "makefile", "cmake", "dockerfile", "toml", "xml", "tex"]
+DIFF_LICENSES = {"mit", "apache-2.0", "bsd-3-clause", "bsd-2-clause", "isc", "cc0-1.0", "unlicense", "mpl-2.0",
+                 "epl-1.0", "artistic-2.0"}
+DIFF_HEAD = 400                     # commits read from the head of each language's file
+
+def render_commit(r):
+    import difflib, hashlib
+    a, b = r["old_contents"].splitlines(keepends = True), r["new_contents"].splitlines(keepends = True)
+    hunks = list(difflib.unified_diff(a, b, f"a/{r['old_file']}", f"b/{r['new_file']}", n = 3))
+    if not hunks or max(len(l) for l in hunks) > 400:      # empty, or minified/generated
+        return None
+    hunks = [l if l.endswith("\n") else l + "\n\\ No newline at end of file\n" for l in hunks]
+    idx = lambda t: hashlib.sha1(f"blob {len(t.encode())}\0{t}".encode()).hexdigest()[:7]
+    msg = "".join(f"    {l}\n" if l.strip() else "\n" for l in r["message"].rstrip().split("\n"))
+    return (f"commit {r['commit']}\n\n{msg}\ndiff --git a/{r['old_file']} b/{r['new_file']}\n"
+            f"index {idx(r['old_contents'])}..{idx(r['new_contents'])} 100644\n" + "".join(hunks))
+
+_DIFF_POOLS = {}
+def diff_pool(purpose):
+    """(texts, refs): per language, runs of commits from one split's repositories, joined as a log."""
+    if purpose in _DIFF_POOLS:
+        return _DIFF_POOLS[purpose]
+    import zlib
+    from huggingface_hub import HfFileSystem
+    fs = HfFileSystem()
+    texts, refs = [], []
+    for lang in DIFF_LANGS:
+        commits = []
+        with fs.open(f"datasets/bigcode/commitpackft/data/{lang}/data.jsonl") as f:
+            for _ in range(DIFF_HEAD):
+                line = f.readline()
+                if not line:
+                    break
+                r = json.loads(line)
+                repo = r["repos"].split(",")[0]
+                if r["license"] not in DIFF_LICENSES or (zlib.crc32(repo.encode()) % 5 == 0) != (purpose == "eval"):
+                    continue
+                c = render_commit(r)
+                if c and len(c) < 12000:
+                    commits.append(c)
+        for i in range(0, len(commits) - 5, 6):
+            texts.append("\n".join(commits[i:i + 6])); refs.append(f"patches/{lang.replace('#', 'sharp').replace('+', 'p')}-{i // 6:03d}.patch")
+    _DIFF_POOLS[purpose] = (texts, refs)
+    return texts, refs
+
 def load_pool(kind, purpose, code_glob = None, lang = None):
     """(texts, refs) for one document kind and purpose."""
     from datasets import load_dataset
+    if kind == "diff":
+        return diff_pool(purpose)
     if kind == "ml":
         arts = wiki_rowgroup(lang, 0 if purpose == "cal" else 1)
         return [a[1] for a in arts], [a[0] for a in arts]
@@ -260,7 +318,7 @@ def load_docs(kind, purpose, n, tokenizer, rng, lo, hi, code_glob = None):
         rng.shuffle(idx)
         got = 0
         for i in idx:
-            c = chunk_tokens(tokenizer, pool[i], rng, lo, hi, code = kind == "code")
+            c = chunk_tokens(tokenizer, pool[i], rng, lo, hi, code = kind in ("code", "diff"))
             if c:
                 docs.append({"kind": kind, "lang": lang or "en", "text": c, "ref": refs[i]})
                 got += 1
@@ -638,7 +696,9 @@ def main(args):
     print(f" -- calibration rows per slice: {rows_for}" + (f" (as generated; repacking from {args.repack})" if src else ""))
 
     # Documents: English prose/code kinds plus multilingual Wikipedia, ml_frac of the document slices
-    kinds = ["web", "wiki", "technical", "code"]
+    kinds = args.doc_kinds.split(",")
+    assert not src or src.get("doc_kinds", "web,wiki,technical,code") == args.doc_kinds, \
+        f"--repack cannot change doc_kinds ({src.get('doc_kinds')} in {args.repack}); the documents are fixed by the trace"
     avg_ctx, avg_loop = 1300 + 450, 2 * 750 + 500                        # rough tokens per conversation
     n_ctx = int(tok_budget["ctx"] / avg_ctx * 1.25) + 1
     n_loop = int(tok_budget["loop"] / avg_loop * 1.25) + 1
@@ -743,7 +803,7 @@ def main(args):
     out = torch.cat([packed[i] for i in order], dim = 0)
     assert out.shape == (R, C), out.shape
     save_file({"input_ids": out.contiguous()}, args.cal_out)
-    json.dump({"shares": gen_shares, "ml_frac": ml_frac, "cal_rows": R, "cal_cols": C, "composition": comp,
+    json.dump({"shares": gen_shares, "ml_frac": ml_frac, "doc_kinds": args.doc_kinds, "cal_rows": R, "cal_cols": C, "composition": comp,
                "source_trace": source_trace,
                **({"packed_shares": shares, "repacked_from": args.repack} if src else {})},
               open(os.path.splitext(args.cal_out)[0] + ".manifest.json", "w"), indent = 1)
@@ -779,6 +839,8 @@ if __name__ == "__main__":
     parser.add_argument("--exclude_swe_from", type = str, default = None,
                         help = "(cal) eval swe trace whose repositories the agent slice must not use; required with an agent share. "
                         "(eval) a calibration trace whose agent sessions' repositories the swe slice must not use")
+    parser.add_argument("--doc_kinds", type = str, default = "web,wiki,technical,code",
+                        help = "(cal) English document kinds for the ctx and loop slices, drawn equally; diff = CommitPackFT commits")
     parser.add_argument("--ml_frac", type = float, default = 0.12, help = "(cal) fraction of documents drawn from non-English Wikipedia")
     parser.add_argument("--exclude_self", type = str, default = None, help = "Eval self-slice trace whose own-voice prompts must not be reused")
     parser.add_argument("--self_from", type = str, default = None, help = "Restrict own-voice prompts to those in this trace (e.g. the set calibration excluded)")
