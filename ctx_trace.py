@@ -53,6 +53,8 @@ ANCHORS = {
              "How would you write tests for this?", "Suggest one refactor that would make this clearer."],
     "diff": ["Review this patch.", "What do these changes do?", "Is there anything wrong with this diff?",
              "Write a changelog entry for these commits.", "Which of these changes is riskiest, and why?"],
+    "log": ["Why is this build failing?", "Summarize the test failures here.", "What's the root cause of this error?",
+            "Is anything in this log an actual problem, or is it noise?", "What should I fix first?"],
 }
 
 # Anchors for non-English documents: half in the document's language, half asking for English
@@ -83,11 +85,12 @@ TOOLS = [
     {"type": "function", "function": {"name": "search", "description": "Search an encyclopedia and return the best matching article.",
         "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
 ]
-TOOL_FOR = {"code": "read_file", "diff": "read_file", "web": "fetch_url", "technical": "fetch_url", "wiki": "search", "ml": "search"}
+TOOL_FOR = {"code": "read_file", "diff": "read_file", "log": "read_file", "web": "fetch_url", "technical": "fetch_url", "wiki": "search", "ml": "search"}
 
 TOOL_TASKS = {
     "code": ["Take a look at {ref} and tell me what it does.", "Is there anything wrong with {ref}?"],
     "diff": ["Review the changes in {ref}.", "Read {ref} and tell me what these commits change."],
+    "log": ["Check {ref} and tell me why CI failed.", "Read {ref} and summarize what went wrong."],
     "web": ["Read {ref} and give me the gist.", "Can you check {ref} and tell me whether it's worth reading?"],
     "technical": ["Read {ref} and explain what it covers.", "Check {ref} and tell me the important parts."],
     "wiki": ["Look up {ref} and give me a short overview.", "Find out about {ref} and tell me the key facts."],
@@ -121,6 +124,8 @@ EVAL_POOL = dict(
                  "What is the purpose of this module?", "Where would a bug most likely hide in this?"],
         "diff": ["Can you sanity-check this change?", "Summarize what changed here.", "Would you merge this? Why or why not?",
                  "What did these commits fix?", "Anything in this diff that looks like a regression?"],
+        "log": ["My build broke - what happened?", "Which of these failures matter?", "Explain this error output to me.",
+                "Is this flaky or a real bug?", "Where would you start debugging from this?"],
     },
     ML_ANCHORS = {
         "zh": ["这篇讲了什么？", "帮我概括一下重点。"], "ja": ["これは何について書かれていますか？", "ポイントを箇条書きにしてください。"],
@@ -140,10 +145,11 @@ EVAL_POOL = dict(
         {"type": "function", "function": {"name": "kb_lookup", "description": "Look up a topic in the knowledge base.",
             "parameters": {"type": "object", "properties": {"topic": {"type": "string", "description": "Topic name"}}, "required": ["topic"]}}},
     ],
-    TOOL_FOR = {"code": "open_document", "diff": "open_document", "web": "browse", "technical": "browse", "wiki": "kb_lookup", "ml": "kb_lookup"},
+    TOOL_FOR = {"code": "open_document", "diff": "open_document", "log": "open_document", "web": "browse", "technical": "browse", "wiki": "kb_lookup", "ml": "kb_lookup"},
     TOOL_TASKS = {
         "code": ["Open {ref} - what's going on in there?", "I think {ref} has an issue, can you check?"],
         "diff": ["Open {ref} and tell me if these changes look right.", "What does the patch in {ref} do?"],
+        "log": ["Open {ref} - why did this run fail?", "What's in {ref}? Anything I need to act on?"],
         "web": ["What's on {ref}?", "Pull up {ref} and summarize."],
         "technical": ["Pull up {ref} and walk me through it.", "What does {ref} cover?"],
         "wiki": ["What do we know about {ref}?", "Background on {ref}, please."],
@@ -262,11 +268,40 @@ def diff_pool(purpose):
     _DIFF_POOLS[purpose] = (texts, refs)
     return texts, refs
 
+# log documents: build and test transcripts of real projects (quantization/stress/logcorpus.py,
+# --log_corpus), clean and with injected faults; the corpus manifest splits projects into cal and
+# eval. Long logs are cut into segments at line boundaries, at most LOG_SEGMENTS per project, so a
+# few verbose test suites do not dominate; short ones (Go is terse) pool per ecosystem.
+LOG_CORPUS = None
+LOG_SEGMENTS, LOG_SEGMENT_CHARS = 12, 16000
+
+def log_pool(purpose):
+    assert LOG_CORPUS, "log documents need --log_corpus"
+    with open(os.path.join(LOG_CORPUS, "manifest.json")) as f:
+        man = [p for p in json.load(f) if p["split"] == purpose]
+    texts, refs, short = [], [], {}
+    for p in man:
+        t = open(os.path.join(LOG_CORPUS, f"{p['eco']}__{p['name']}.log"), errors = "replace").read()
+        if len(t) < LOG_SEGMENT_CHARS:
+            short[p["eco"]] = short.get(p["eco"], "") + t + "\n"; continue
+        segs, a = [], 0
+        while a < len(t) - LOG_SEGMENT_CHARS // 4:
+            b = t.find("\n", a + LOG_SEGMENT_CHARS); b = len(t) if b < 0 else b
+            segs.append(t[a:b]); a = b + 1
+        step = max(1, len(segs) // LOG_SEGMENTS)
+        for k, sg in enumerate(segs[::step][:LOG_SEGMENTS]):
+            texts.append(sg); refs.append(f"logs/{p['eco']}-{p['name']}-{k}.log")
+    for eco, t in short.items():
+        texts.append(t); refs.append(f"logs/{eco}-ci.log")
+    return texts, refs
+
 def load_pool(kind, purpose, code_glob = None, lang = None):
     """(texts, refs) for one document kind and purpose."""
     from datasets import load_dataset
     if kind == "diff":
         return diff_pool(purpose)
+    if kind == "log":
+        return log_pool(purpose)
     if kind == "ml":
         arts = wiki_rowgroup(lang, 0 if purpose == "cal" else 1)
         return [a[1] for a in arts], [a[0] for a in arts]
@@ -318,7 +353,7 @@ def load_docs(kind, purpose, n, tokenizer, rng, lo, hi, code_glob = None):
         rng.shuffle(idx)
         got = 0
         for i in idx:
-            c = chunk_tokens(tokenizer, pool[i], rng, lo, hi, code = kind in ("code", "diff"))
+            c = chunk_tokens(tokenizer, pool[i], rng, lo, hi, code = kind in ("code", "diff", "log"))
             if c:
                 docs.append({"kind": kind, "lang": lang or "en", "text": c, "ref": refs[i]})
                 got += 1
@@ -625,7 +660,8 @@ def main(args):
     rng = random.Random(args.seed)
     purpose = args.docs
     use_pool(purpose)
-    global SWE_TOKENIZER, SWE_TV, SWE_EXCLUDE
+    global SWE_TOKENIZER, SWE_TV, SWE_EXCLUDE, LOG_CORPUS
+    LOG_CORPUS = args.log_corpus
     SWE_TOKENIZER, SWE_TV = tokenizer, tv
     if purpose == "eval" and args.exclude_swe_from:      # the other direction: keep a calibration's repositories out of eval
         with open(args.exclude_swe_from) as f:
@@ -840,7 +876,9 @@ if __name__ == "__main__":
                         help = "(cal) eval swe trace whose repositories the agent slice must not use; required with an agent share. "
                         "(eval) a calibration trace whose agent sessions' repositories the swe slice must not use")
     parser.add_argument("--doc_kinds", type = str, default = "web,wiki,technical,code",
-                        help = "(cal) English document kinds for the ctx and loop slices, drawn equally; diff = CommitPackFT commits")
+                        help = "(cal) English document kinds for the ctx and loop slices, drawn equally; diff = CommitPackFT commits, "
+                               "log = --log_corpus build and test transcripts")
+    parser.add_argument("--log_corpus", type = str, default = None, help = "logcorpus.py output directory, for the log document kind")
     parser.add_argument("--ml_frac", type = float, default = 0.12, help = "(cal) fraction of documents drawn from non-English Wikipedia")
     parser.add_argument("--exclude_self", type = str, default = None, help = "Eval self-slice trace whose own-voice prompts must not be reused")
     parser.add_argument("--self_from", type = str, default = None, help = "Restrict own-voice prompts to those in this trace (e.g. the set calibration excluded)")
