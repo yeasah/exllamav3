@@ -732,19 +732,23 @@ def main(args):
     print(f" -- calibration rows per slice: {rows_for}" + (f" (as generated; repacking from {args.repack})" if src else ""))
 
     # Documents: English prose/code kinds plus multilingual Wikipedia, ml_frac of the document slices
-    kinds = args.doc_kinds.split(",")
+    # kind or kind:weight; documents per kind in proportion to weight (default 1), in each of ctx and loop
+    from fractions import Fraction
+    kw = {k.split(":")[0]: Fraction(k.split(":")[1]) if ":" in k else Fraction(1) for k in args.doc_kinds.split(",")}
+    kinds, W = list(kw), sum(kw.values())
+    per_kind = lambda total, k: -(-(total * kw[k]) // W)               # ceil; equal weights as before
     assert not src or src.get("doc_kinds", "web,wiki,technical,code") == args.doc_kinds, \
         f"--repack cannot change doc_kinds ({src.get('doc_kinds')} in {args.repack}); the documents are fixed by the trace"
     avg_ctx, avg_loop = 1300 + 450, 2 * 750 + 500                        # rough tokens per conversation
     n_ctx = int(tok_budget["ctx"] / avg_ctx * 1.25) + 1
     n_loop = int(tok_budget["loop"] / avg_loop * 1.25) + 1
     n_ml = int(round(ml_frac * n_ctx))
-    ctx_docs = [d for k in kinds for d in load_docs(k, purpose, -(-(n_ctx - n_ml) // len(kinds)), tokenizer, rng, lo, hi)]
+    ctx_docs = [d for k in kinds for d in load_docs(k, purpose, per_kind(n_ctx - n_ml, k), tokenizer, rng, lo, hi)]
     ctx_docs += load_docs("ml", purpose, n_ml, tokenizer, rng, lo, hi)
     rng.shuffle(ctx_docs)
     n_loop_docs = n_loop * 3
     n_loop_ml = int(round(ml_frac * n_loop_docs))
-    loop_docs = [d for k in kinds for d in load_docs(k, purpose, -(-(n_loop_docs - n_loop_ml) // len(kinds)), tokenizer, rng, lo // 2, hi // 2)]
+    loop_docs = [d for k in kinds for d in load_docs(k, purpose, per_kind(n_loop_docs - n_loop_ml, k), tokenizer, rng, lo // 2, hi // 2)]
     loop_docs += load_docs("ml", purpose, n_loop_ml, tokenizer, rng, lo // 2, hi // 2)
     rng.shuffle(loop_docs)
 
@@ -876,7 +880,7 @@ if __name__ == "__main__":
                         help = "(cal) eval swe trace whose repositories the agent slice must not use; required with an agent share. "
                         "(eval) a calibration trace whose agent sessions' repositories the swe slice must not use")
     parser.add_argument("--doc_kinds", type = str, default = "web,wiki,technical,code",
-                        help = "(cal) English document kinds for the ctx and loop slices, drawn equally; diff = CommitPackFT commits, "
+                        help = "(cal) English document kinds for the ctx and loop slices, as kind or kind:weight (default 1); diff = CommitPackFT commits, "
                                "log = --log_corpus build and test transcripts")
     parser.add_argument("--log_corpus", type = str, default = None, help = "logcorpus.py output directory, for the log document kind")
     parser.add_argument("--ml_frac", type = float, default = 0.12, help = "(cal) fraction of documents drawn from non-English Wikipedia")
