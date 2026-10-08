@@ -40,6 +40,9 @@ The trace should come from the unquantized model or a high-bitrate quant (e.g. 6
 sc_trace.py. Document sources are disjoint by purpose: calibration uses the bundled corpus and
 Wikipedia row group 0 per language; eval uses openwebtext (end of the dataset), wikitext-2
 validation, --code_glob source files and Wikipedia row group 1.
+
+Dependencies: exllamav3's eval extras (datasets, pyarrow, huggingface_hub). --backend vllm also
+needs vllm, imported only when selected.
 """
 
 ANCHORS = {

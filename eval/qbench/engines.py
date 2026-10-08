@@ -404,6 +404,10 @@ class TransformersBackend:
         self.device = device
         self.dtype = dtype
         self.streaming = options.get("streaming", False)
+        # Layer-major streaming keeps every waiting row's activations on the device; past the
+        # card's free memory (2.2M context tokens at hidden 4096 is ~18 GB) rows run in groups,
+        # each a full streamed pass. Default: sized from free memory when the pass starts
+        self.stream_tokens = options.get("streaming_max_tokens")
         # Quantize in-process instead of loading a quantized checkpoint. Exists because
         # two things worth measuring cannot reach here any other way: SINQ's 2D tiling
         # quantizes and serves correctly but does not survive save_pretrained ->
@@ -1038,19 +1042,26 @@ class TransformersBackend:
             raise RuntimeError("Could not locate decoder layer list for noise injection")
         return best
 
-    def _noise_hooks(self, noise_eps):
+    def _noise_hooks(self, noise_eps, row_of):
+        # Noise keyed to (row, layer), reseeded per call: a row's noise floor then does not
+        # depend on which rows ran before it, how many, or how a streamed pass grouped them.
+        # (One generator consumed in call order made each row's floor a function of the whole
+        # trace: grouping moved a 37-row floor by 1.2%.) row_of() gives the row's index in
+        # the caller's trace
         gens = {}
-        def hook(module, inputs, output):
-            out = output[0] if isinstance(output, tuple) else output
-            if out.device not in gens:
-                g = torch.Generator(device = out.device)
-                g.manual_seed(1)
-                gens[out.device] = g
-            out = apply_mult_noise(out, noise_eps, gens[out.device])
-            if isinstance(output, tuple):
-                return (out,) + output[1:]
-            return out
-        return [layer.register_forward_hook(hook) for layer in self._decoder_layers()]
+        def make(li):
+            def hook(module, inputs, output):
+                out = output[0] if isinstance(output, tuple) else output
+                g = gens.get(out.device)
+                if g is None:
+                    g = gens[out.device] = torch.Generator(device = out.device)
+                g.manual_seed(1 + 1_000_003 * row_of() + li)
+                out = apply_mult_noise(out, noise_eps, g)
+                if isinstance(output, tuple):
+                    return (out,) + output[1:]
+                return out
+            return hook
+        return [layer.register_forward_hook(make(li)) for li, layer in enumerate(self._decoder_layers())]
 
     # ------ streaming machinery
 
@@ -1433,7 +1444,7 @@ class TransformersBackend:
                     sub._parameters[pn] = torch.nn.Parameter(p.to("meta"), requires_grad = False)
 
     @torch.inference_mode()
-    def _run_streaming(self, ids: torch.Tensor, callback, noise_eps: float = None, ranges: list = None):
+    def _run_streaming(self, ids: torch.Tensor, callback, noise_eps: float = None, ranges: list = None, row_ids: list = None):
         base = self.model.base_model
         layers = self._decoder_layers()
         embed = self.model.get_input_embeddings()
@@ -1543,7 +1554,7 @@ class TransformersBackend:
         # Noise hooks first: they must fire inside the serialized window (before post_hook
         # advances the turn), since their torch.Generator is not thread-safe
         if noise_eps:
-            hooks += self._noise_hooks(noise_eps)
+            hooks += self._noise_hooks(noise_eps, lambda: (row_ids[tls.row] if row_ids is not None else tls.row))
         for m in hook_modules:
             hooks.append(m.register_forward_pre_hook(pre_hook))
             hooks.append(m.register_forward_hook(post_hook))
@@ -1594,13 +1605,43 @@ class TransformersBackend:
                 h.remove()
 
     @torch.inference_mode()
+    def _stream_groups(self, ids: torch.Tensor, ranges: list = None):
+        """Row index groups whose total length fits the streaming token budget."""
+        lens = [r[1] for r in ranges] if ranges is not None else [ids.shape[1]] * ids.shape[0]
+        budget = self.stream_tokens
+        if budget is None:
+            cfg = self.model.config
+            hidden = getattr(cfg, "hidden_size", None) or cfg.get_text_config().hidden_size
+            free = torch.cuda.mem_get_info(self.device)[0]
+            # Measured: 2.18M waiting tokens at hidden 4096 took ~18 GB, about one bf16 hidden
+            # state per token. Budget two (a residual too) against 60% of free memory, leaving
+            # the rest for the module being materialized
+            budget = int(0.6 * free / (hidden * 4))
+        groups, cur, n = [], [], 0
+        for i, l in enumerate(lens):
+            if cur and n + l > budget:
+                groups.append(cur); cur, n = [], 0
+            cur.append(i); n += l
+        if cur:
+            groups.append(cur)
+        return groups
+
     def run(self, ids: torch.Tensor, callback, noise_eps: float = None, ranges: list = None):
         if self.streaming:
-            return self._run_streaming(ids, callback, noise_eps, ranges)
-        hooks = self._noise_hooks(noise_eps) if noise_eps else []
+            groups = self._stream_groups(ids, ranges)
+            if len(groups) > 1:
+                print(f" -- streaming {ids.shape[0]} rows in {len(groups)} groups (token budget per pass)")
+            for g in groups:
+                sub = ids[g]
+                sub_ranges = [ranges[i] for i in g] if ranges is not None else None
+                self._run_streaming(sub, lambda r, *a, g = g: callback(g[r], *a), noise_eps, sub_ranges, row_ids = g)
+            return
+        cur = {"row": 0}
+        hooks = self._noise_hooks(noise_eps, lambda: cur["row"]) if noise_eps else []
         try:
             with ProgressBar("Evaluating", ids.shape[0]) as pb:
                 for r in range(ids.shape[0]):
+                    cur["row"] = r
                     row = ids[r:r + 1].to(self.model.device)
                     out = self.model(input_ids = row, use_cache = False)
                     callback(r, out.logits)
