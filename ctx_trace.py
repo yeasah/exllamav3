@@ -578,8 +578,53 @@ def make_sampler(mode = None):
         return ComboSampler(**{SAMPLER_KEYS.get(k, k): v for k, v in PROFILE["modes"][mode].items()})
     return ComboSampler(**SAMPLING) if SAMPLING is not None else None
 
+# --backend vllm: for models exllamav3 cannot hold, such as a 27B in FP8 on two 16 GB cards.
+# Conversations, template rendering and rows are unchanged; only sampling runs in vLLM, one engine
+# per process (vLLM does not return all its VRAM when an engine closes). Per-row seeds and the
+# sampling profile carry over; vLLM's presence/frequency penalties count generated tokens only,
+# as ComboSampler's do here. Rows carry no stop token, as exllamav3's do.
+VLLM_DEFAULTS = {"language_model_only": True, "max_model_len": 17408}
+VLLM_KEYS = {"pres_p": "presence_penalty", "freq_p": "frequency_penalty", "rep_p": "repetition_penalty"}
+
+class VllmBackend:
+    def __init__(self, model_dir, engine_args, seed):
+        # FlashInfer's top-p kernel takes workspace vLLM's memory profiling does not count; on a
+        # card filled to the edge it fails in warmup. The native sampler is equivalent
+        os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+        from vllm import LLM
+        kw = dict(VLLM_DEFAULTS, **engine_args)
+        kw.setdefault("tensor_parallel_size", torch.cuda.device_count())
+        self.max_len = kw["max_model_len"]
+        self.llm = LLM(model = model_dir, seed = seed, **kw)
+
+    def params(self, mode, max_new_tokens, prompt_len, stop_ids, seed):
+        from vllm import SamplingParams
+        if mode is not None:
+            src = PROFILE["modes"][mode]
+        elif SAMPLING is not None:
+            src = SAMPLING
+        else:
+            src = {"temperature": 0.8, "min_p": 0.08}             # exllamav3's DefaultSampler
+        kw = {VLLM_KEYS.get(k, k): v for k, v in src.items()}
+        room = self.max_len - prompt_len
+        assert room > 0, f"prompt of {prompt_len} tokens does not fit max_model_len {self.max_len}"
+        return SamplingParams(**kw, max_tokens = min(max_new_tokens, room), stop_token_ids = stop_ids, seed = seed)
+
+    def run(self, requests):
+        """requests: [(input_ids list, SamplingParams)] -> [(response_ids, eos_reason)]"""
+        outs = self.llm.generate([{"prompt_token_ids": ids} for ids, _ in requests], [sp for _, sp in requests])
+        res = []
+        for o, (_, sp) in zip(outs, requests):
+            ids, fin = list(o.outputs[0].token_ids), o.outputs[0].finish_reason
+            if fin == "stop" and ids and ids[-1] in sp.stop_token_ids:
+                ids = ids[:-1]
+            res.append((ids, "stop_token" if fin == "stop" else "max_new_tokens" if fin == "length" else fin))
+        return res
+
 def generate(generator, config, tokenizer, convs, template_vars, max_new_tokens, seed):
     """convs: list of (meta, messages, tools). Returns trace rows."""
+    if isinstance(generator, VllmBackend):
+        return generate_vllm(generator, config, tokenizer, convs, template_vars, max_new_tokens, seed)
     pending = {}
     for i, (meta, msgs, tools) in enumerate(convs):
         kw = dict(meta.get("template_vars") or template_vars, **({"tools": tools} if tools else {}))
@@ -618,6 +663,24 @@ def generate(generator, config, tokenizer, convs, template_vars, max_new_tokens,
     return rows
 
 
+def generate_vllm(backend, config, tokenizer, convs, template_vars, max_new_tokens, seed):
+    reqs, metas = [], []
+    for i, (meta, msgs, tools) in enumerate(convs):
+        kw = dict(meta.get("template_vars") or template_vars, **({"tools": tools} if tools else {}))
+        input_ids = tokenizer.hf_chat_template(msgs, add_generation_prompt = True, **kw)[0].tolist()
+        mode = sampling_mode(meta, kw) if PROFILE is not None else None
+        reqs.append((input_ids, backend.params(mode, max_new_tokens, len(input_ids), config.eos_token_id_list,
+                                               zlib.crc32(f"{seed}|{i}".encode()))))
+        metas.append((meta, mode))
+    rows = []
+    for i, ((input_ids, _), (meta, mode), (resp, eos)) in enumerate(zip(reqs, metas, backend.run(reqs))):
+        print(f"    {i:3} {meta['slice']:9s} {meta.get('lang', ''):3s} ctx {len(input_ids):5}  resp {len(resp):5} ({eos})", flush = True)
+        if resp:
+            rows.append({**meta, "eos_reason": eos, **({"sampling_mode": mode} if mode is not None else {}),
+                         "input_ids": input_ids, "response_ids": resp})
+    return rows
+
+
 def build_convs(sl, n, docs, loop_docs, rng, self_pool):
     convs = []
     if sl in ("ctx_user", "ctx_tool", "ctx_ml"):
@@ -653,6 +716,10 @@ def main(args):
         # and their responses come from the trace instead of the model
         config = Config.from_directory(args.model_dir)
         tokenizer, generator = Tokenizer.from_config(config), None
+    elif args.backend == "vllm":
+        config = Config.from_directory(args.model_dir)
+        tokenizer = Tokenizer.from_config(config)
+        generator = VllmBackend(args.model_dir, args.vllm, args.seed)
     else:
         model, config, cache, tokenizer = model_init.init(args)[:4]
         generator = Generator(model = model, cache = cache, tokenizer = tokenizer, max_chunk_size = 2048)
@@ -865,6 +932,11 @@ def write_trace(path, args, tokenizer, tv, rows, meta):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev = False)
     model_init.add_args(parser, default_cache_size = 65536)
+    parser.add_argument("--backend", type = str, default = "exllamav3", choices = ["exllamav3", "vllm"],
+                        help = "Generation backend. vllm loads -m as vLLM does (e.g. an FP8 checkpoint), one engine per process")
+    parser.add_argument("--vllm", type = json.loads, default = {},
+                        help = "vLLM engine arguments, JSON, over VLLM_DEFAULTS; Qwen3.8-27B FP8 on 2x16 GB: "
+                               "'{\"max_num_batched_tokens\": 1024, \"enforce_eager\": true, \"gpu_memory_utilization\": 0.968}'")
     parser.add_argument("-o", "--output", type = str, required = True, help = "Output prefix; writes <prefix>_<slice>.json")
     parser.add_argument("--docs", type = str, default = "eval", choices = ["eval", "cal"], help = "Document sources: held-out eval text, or the calibration corpus")
     parser.add_argument("--slices", type = str, default = "ctx_user,ctx_tool,ctx_ml,loop,self,wild", help = "(eval) slices to write")
