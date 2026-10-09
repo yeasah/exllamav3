@@ -249,7 +249,12 @@ class Exl3Backend:
         states = list(row_ids)
         # Inter-module states move to host memory when they would crowd the device; decided once,
         # from the real size after the first module, against QBENCH_STATE_BUDGET_GB (default 3)
-        state_budget = float(os.environ.get("QBENCH_STATE_BUDGET_GB", "3")) * 2 ** 30
+        # Row states stay on the device up to this budget, past it in host memory between
+        # modules (a PCIe round trip per module, single-threaded). Default: half the device's
+        # free memory when the pass starts -- a fixed 3 GiB, tuned on 16 GB cards, pushed 8.8
+        # GiB of states through host memory on a 46 GB card with room to spare
+        env_budget = os.environ.get("QBENCH_STATE_BUDGET_GB")
+        state_budget = float(env_budget) * 2 ** 30 if env_budget else 0.5 * torch.cuda.mem_get_info(self.device)[0]
         offload_states = None
         gen = torch.Generator(device = self.device)
         gen.manual_seed(1)
