@@ -166,7 +166,9 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
         print(f"     - {f}")
         source_file_path = os.path.join(in_dir, f)
         target_file_path = os.path.join(out_dir, f)
-        shutil.copy(source_file_path, target_file_path)
+        # Contents only: copying the mode (shutil.copy) fails on storage that refuses chmod,
+        # such as an S3-backed FUSE volume
+        shutil.copyfile(source_file_path, target_file_path)
     if ignored_files:
         print(f" !! Warning, the following file(s) will not be included in output model:")
         for f in ignored_files[:10]:
