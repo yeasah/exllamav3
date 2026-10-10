@@ -239,7 +239,39 @@ class Exl3Backend:
         )
         module.quant_type = "fp16"
 
+    def _state_budget(self):
+        # Row states stay on the device up to this budget, past it in host memory between
+        # modules (a PCIe round trip per module, single-threaded). Default: half the device's
+        # free memory when the pass starts -- a fixed 3 GiB, tuned on 16 GB cards, pushed 8.8
+        # GiB of states through host memory on a 46 GB card with room to spare
+        env_budget = os.environ.get("QBENCH_STATE_BUDGET_GB")
+        return float(env_budget) * 2 ** 30 if env_budget else 0.5 * torch.cuda.mem_get_info(self.device)[0]
+
     def run(self, ids: torch.Tensor, callback, noise_eps: float = None, ranges: list = None):
+        """Rows in groups whose states fit the device, each group a full streamed pass. One
+        pass over everything pushed a 200-session swe trace's 42.8 GiB of states (27B,
+        2.2M tokens) through host memory for every module: a CPU core pinned per process and
+        the GPU at half use. A pass per group re-reads the quant's weights instead -- tens of
+        GB from the page cache against terabytes of PCIe traffic."""
+        lens = [ranges[r][1] if ranges is not None else ids.shape[1] for r in range(ids.shape[0])]
+        hidden = getattr(self.config, "hidden_size", None) or 4096
+        per_token = hidden * 4                  # measured: 42.8 GiB / 2.2M tokens at hidden 5120
+        budget = self._state_budget()
+        groups, cur, n = [], [], 0
+        for i, l in enumerate(lens):
+            if cur and (n + l) * per_token > budget:
+                groups.append(cur); cur, n = [], 0
+            cur.append(i); n += l
+        if cur:
+            groups.append(cur)
+        if len(groups) > 1:
+            print(f" -- qbench: {ids.shape[0]} rows in {len(groups)} passes (row states per pass within "
+                  f"{budget / 2**30:.1f} GiB)")
+        for g in groups:
+            self._run_pass(ids[g], lambda r, *a, g = g: callback(g[r], *a), noise_eps,
+                           [ranges[i] for i in g] if ranges is not None else None, g)
+
+    def _run_pass(self, ids: torch.Tensor, callback, noise_eps: float, ranges: list, row_index: list):
         from exllamav3.modules import Embedding, Linear
         modules = self.model.modules
         # Trim each row to the end of its score range: trailing padding is causally inert for
@@ -247,17 +279,11 @@ class Exl3Backend:
         # memory (40 agent rows padded to 17.5k tokens carried ~7 GB of states)
         row_ids = [ids[r:r + 1, :ranges[r][1]] if ranges is not None else ids[r:r + 1] for r in range(ids.shape[0])]
         states = list(row_ids)
-        # Inter-module states move to host memory when they would crowd the device; decided once,
-        # from the real size after the first module, against QBENCH_STATE_BUDGET_GB (default 3)
-        # Row states stay on the device up to this budget, past it in host memory between
-        # modules (a PCIe round trip per module, single-threaded). Default: half the device's
-        # free memory when the pass starts -- a fixed 3 GiB, tuned on 16 GB cards, pushed 8.8
-        # GiB of states through host memory on a 46 GB card with room to spare
-        env_budget = os.environ.get("QBENCH_STATE_BUDGET_GB")
-        state_budget = float(env_budget) * 2 ** 30 if env_budget else 0.5 * torch.cuda.mem_get_info(self.device)[0]
+        # Inter-module states move to host memory if they still crowd the device (run() sizes
+        # the groups to avoid it); decided once, from the real size after the first module
+        state_budget = self._state_budget()
         offload_states = None
         gen = torch.Generator(device = self.device)
-        gen.manual_seed(1)
 
         sum_bits = sum_numel = head_bits = head_numel = embed_bits = embed_numel = 0
         with ProgressBar("Streaming", len(modules)) as pb:
@@ -349,6 +375,8 @@ class Exl3Backend:
                         x = x[:, ranges[r][0]:ranges[r][1]].contiguous()
                     x = module.forward(x, params)
                     if noise_eps and idx < len(modules) - 2 and x.is_floating_point():
+                        # Keyed to (row, module), so grouping and row order leave it unchanged
+                        gen.manual_seed(1 + 1_000_003 * row_index[r] + idx)
                         x = apply_mult_noise(x, noise_eps, gen)
                     if logits_layer:
                         callback(r, x, offset)

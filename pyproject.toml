@@ -37,6 +37,7 @@ eval = [
     "datasets",
     "pyarrow",
     "accelerate",
+    "flash-linear-attention",
     "huggingface_hub",
     "gguf>=0.14.0",
     "llama-cpp-python",
