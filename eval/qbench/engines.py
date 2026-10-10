@@ -1859,11 +1859,14 @@ class LlamaCppBackend:
         assert not noise_eps, "Noise injection not supported for llamacpp engine"
         with ProgressBar("Evaluating", ids.shape[0]) as pb:
             for r in range(ids.shape[0]):
+                # Evaluate up to the score range's end and move only the scored positions: the
+                # whole padded row as fp32 is [trace width, vocab], 10.5 GB for one row of a
+                # 17k-wide trace at Qwen's vocab, which ran a 16 GB card out of memory
+                a, b = ranges[r] if ranges is not None else (0, ids.shape[1])
                 self.model.reset()
-                self.model.eval(ids[r].tolist())
-                logits = torch.from_numpy(self.model.scores).unsqueeze(0)
-                logits = logits[:, :ids.shape[1]].to(self.device)
-                callback(r, logits)
+                self.model.eval(ids[r, :b].tolist())
+                logits = torch.from_numpy(self.model.scores[a:b]).unsqueeze(0).to(self.device)
+                callback(r, logits, a)
                 pb.update(r + 1)
 
     def close(self):
