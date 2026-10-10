@@ -438,7 +438,7 @@ class TransformersBackend:
         self.dtype = dtype
         self.streaming = options.get("streaming", False)
         # Layer-major streaming keeps every waiting row's activations on the device; past the
-        # card's free memory (2.2M context tokens at hidden 4096 is ~18 GB) rows run in groups,
+        # card's free memory (two hidden states and the rope tables per token) rows run in groups,
         # each a full streamed pass. Default: sized from free memory when the pass starts
         self.stream_tokens = options.get("streaming_max_tokens")
         # Quantize in-process instead of loading a quantized checkpoint. Exists because
@@ -1572,7 +1572,15 @@ class TransformersBackend:
                 st["active"] = me
                 cv.notify_all()
 
+        # PyTorch keeps a cuBLAS workspace per thread's handle (32 MiB on recent GPUs), and every
+        # row here is its own live thread: 166 rows of a 200-session trace held 4.9 GiB of them,
+        # more than their activations on a small model. Rows compute one at a time, so each drops
+        # its workspace when its turn ends; the next one's first matmul takes it back from the
+        # caching allocator (frees are stream-ordered, so in-flight kernels are safe)
+        clear_workspaces = getattr(torch._C, "_cuda_clearCublasWorkspaces", lambda: None)
+
         def post_hook(module, args, output):
+            clear_workspaces()
             with cv:
                 st["turn"] += 1
                 if st["turn"] == num_rows:
@@ -1644,12 +1652,18 @@ class TransformersBackend:
         budget = self.stream_tokens
         if budget is None:
             cfg = self.model.config
-            hidden = getattr(cfg, "hidden_size", None) or cfg.get_text_config().hidden_size
+            tcfg = cfg if getattr(cfg, "hidden_size", None) else cfg.get_text_config()
+            hidden = tcfg.hidden_size
+            head_dim = getattr(tcfg, "head_dim", None) or hidden // tcfg.num_attention_heads
             free = torch.cuda.mem_get_info(self.device)[0]
-            # Measured: 2.18M waiting tokens at hidden 4096 took ~18 GB, about one bf16 hidden
-            # state per token. Budget two (a residual too) against 60% of free memory, leaving
-            # the rest for the module being materialized
-            budget = int(0.6 * free / (hidden * 4))
+            # A waiting row holds two hidden states (the layer input, and the embedding output
+            # the base forward keeps as a local for the whole pass) and the rope cos/sin, which
+            # do not scale with width: measured on Qwen3-0.6B (hidden 1024, head_dim 128) by
+            # allocation site, exactly 2 x 2048 B per token plus bf16 cos/sin at 512. Counted
+            # here at fp32 for models that keep them so. 60% of free memory, the rest for the
+            # materialized module and the active row's transients
+            per_token = 2 * hidden * torch.finfo(self.dtype).bits // 8 + 2 * head_dim * 4
+            budget = int(0.6 * free / per_token)
         groups, cur, n = [], [], 0
         for i, l in enumerate(lens):
             if cur and n + l > budget:
