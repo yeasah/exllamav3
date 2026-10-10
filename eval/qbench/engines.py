@@ -1815,6 +1815,16 @@ class LlamaCppBackend:
         import llama_cpp
         from llama_cpp import Llama
         self.device = device
+        # A CPU-only build (or no visible GPU) ignores n_gpu_layers and runs everything on the CPU, silently: hours
+        # instead of minutes, every core pinned, GPU idle (a source build without -DGGML_CUDA=on).
+        # Refuse unless CPU was asked for
+        if options.get("n_gpu_layers", 999) != 0 and not llama_cpp.llama_supports_gpu_offload():
+            raise RuntimeError(
+                "llama.cpp can't offload (llama_supports_gpu_offload() is False): no visible GPU, or a "
+                "CPU-only llama-cpp-python build (no libggml-cuda.so in llama_cpp/lib), so GPU layers "
+                "were requested but would run on the CPU. Rebuild it with CUDA: "
+                "CMAKE_ARGS='-DGGML_CUDA=on' pip install --no-deps --force-reinstall --no-binary=llama-cpp-python "
+                "llama-cpp-python -- or set options.n_gpu_layers: 0 to score on the CPU deliberately")
         self.info = gguf_storage_info(source)
         split_modes = {
             "layer": llama_cpp.LLAMA_SPLIT_MODE_LAYER,
