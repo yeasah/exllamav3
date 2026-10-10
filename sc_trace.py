@@ -636,12 +636,20 @@ def main(args):
     def total_packed():
         return total_in + total_out
 
+    excluded = set()
+    if args.exclude_self:
+        # Own-voice prompts an eval holds out (ctx_trace's self slice draws from this same list):
+        # calibrating on them would score the quant on its own calibration prompts
+        excluded = {r["conversation"] for r in json.load(open(args.exclude_self))["rows"]}
+        print(f" -- excluding {len(excluded)} conversations listed in {args.exclude_self}")
     with ProgressBar("Sampling", target_tokens) as pb:
         for epoch in range(args.max_epochs):
             if total_packed() >= target_tokens:
                 break
-            convs = [{"messages": [], "turns": [seed] + fu, "alive": True}
-                     for seed, fu in CONVERSATIONS]
+            # Excluded conversations stay in the list, never alive: every other conversation keeps
+            # its index, and so its per-job seed, as in an unfiltered run
+            convs = [{"messages": [], "turns": [seed] + fu, "alive": c_idx not in excluded}
+                     for c_idx, (seed, fu) in enumerate(CONVERSATIONS)]
             max_turns = max(len(c["turns"]) for c in convs)
 
             # Turn-major waves: every conversation's turn t runs as one concurrent batch, so a
@@ -760,6 +768,8 @@ if __name__ == "__main__":
     parser.add_argument("-cc", "--cal_cols", type = int, default = 2048, help = "Tokens per calibration row, default: 2048")
     parser.add_argument("--target_tokens", type = int, default = None, help = "Token collection target, default: cal_rows * cal_cols")
     parser.add_argument("--max_new_tokens", type = int, default = 3072, help = "Per-turn generation cap, default: 3072")
+    parser.add_argument("--exclude_self", type = str, default = None,
+                        help = "Trace (rows with 'conversation') whose conversations to leave out, e.g. an eval's held-out own-voice prompts")
     parser.add_argument("--max_epochs", type = int, default = 4, help = "Max passes over the seed set (later epochs resample with different seeds), default: 4")
     parser.add_argument("--seed", type = int, default = 0, help = "Base RNG seed (per-job seeds derive from it)")
     parser.add_argument("-tv", "--template_vars", type = json.loads, default = {}, help = 'JSON dict of chat template variables, merged over the defaults')
