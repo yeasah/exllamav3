@@ -88,7 +88,12 @@ def main(args):
 
     model = Model.from_config(config)
     print(f" -- Loading model: {args.model}")
-    model.load(device = device)
+    if args.gpu_split:
+        # The whole unquantized model stays resident; past one card's memory (a 9B in fp16 on
+        # 16 GB) it is autosplit. Every forward here follows each module's own device
+        model.load(use_per_device = [float(x) for x in args.gpu_split.split(",")])
+    else:
+        model.load(device = device)
 
     total_rows = args.rows + (args.h_rows if args.shaped else 0)
     if args.trace:
@@ -464,6 +469,7 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--rows", type = int, default = 10, help = "Number of eval rows, default: 10")
     parser.add_argument("-l", "--length", type = int, default = 1024, help = "Tokens per row, default: 1024")
     parser.add_argument("-d", "--device", type = int, default = 0, help = "CUDA device index")
+    parser.add_argument("-gs", "--gpu_split", type = str, default = None, help = "Comma-separated GB per device to autosplit the model across, instead of --device")
     parser.add_argument("-tr", "--trace", type = str, default = None, help = "Packed self-sampled trace (safetensors from sc_trace.py) to use as eval")
     parser.add_argument("-sh", "--shaped", action = "store_true", help = "LDLQ-shaped noise from captured Hessians (recommended; extra capture pass)")
     parser.add_argument("-hr", "--h_rows", type = int, default = 64, help = "Calibration rows for Hessian capture in shaped mode, default: 64")
