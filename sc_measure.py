@@ -158,7 +158,10 @@ def main(args):
                 x = mod.prepare_for_device(x, params)
                 # Residual stream is mutated in place downstream; every cached state must be
                 # cloned or all mid-stream experiments run on corrupted inputs
-                boundary[i].append(x.clone() if x.is_floating_point() else x)
+                # Every row's input to every module: rows x len x hidden x num_mods on the devices,
+                # which past ~10 rows of a 9B fills a 16 GB card. With --boundary_cpu it lives in
+                # host memory; every reader moves it back (prepare_for_device, .to(st.device))
+                boundary[i].append((x.to("cpu", copy = True) if args.boundary_cpu else x.clone()) if x.is_floating_point() else x)
                 x = mod.forward(x, params)
             logits.append(x.half().cpu())
         return boundary, logits
@@ -469,6 +472,7 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--rows", type = int, default = 10, help = "Number of eval rows, default: 10")
     parser.add_argument("-l", "--length", type = int, default = 1024, help = "Tokens per row, default: 1024")
     parser.add_argument("-d", "--device", type = int, default = 0, help = "CUDA device index")
+    parser.add_argument("-bc", "--boundary_cpu", action = "store_true", help = "Keep the cached per-module input states in host memory (more eval rows than fit the device beside the model)")
     parser.add_argument("-gs", "--gpu_split", type = str, default = None, help = "Comma-separated GB per device to autosplit the model across, instead of --device")
     parser.add_argument("-tr", "--trace", type = str, default = None, help = "Packed self-sampled trace (safetensors from sc_trace.py) to use as eval")
     parser.add_argument("-sh", "--shaped", action = "store_true", help = "LDLQ-shaped noise from captured Hessians (recommended; extra capture pass)")
