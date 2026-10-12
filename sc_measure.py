@@ -114,6 +114,11 @@ def main(args):
     mods = model.modules
     num_mods = len(mods)
 
+    # Per-row KLs of the latest forward_rows call, kept with --row_klds: rows differ ~10x in absolute
+    # KL by content (raw text and code against the model's own chat), so a plain mean is set by the
+    # loudest rows; recorded per row, a measurement can be reweighted afterwards without re-running
+    row_klds = []
+
     @torch.inference_mode()
     def forward_rows(start_idx, states, collect_states = False):
         """
@@ -122,6 +127,7 @@ def main(args):
         """
         kld_sum = 0.0
         out_states = []
+        row_klds.clear()
         for r, state in enumerate(states):
             params = {}
             x = state.clone() if state.is_floating_point() else state
@@ -142,6 +148,7 @@ def main(args):
                 kl_row += compute_kl_div(x2[a:b].float(), ref2[a:b].to(x.device), kl_vocab).sum().item()
                 n_row += b - a
             kld_sum += kl_row / n_row
+            row_klds.append(kl_row / n_row)
             del x
         return kld_sum / len(states), out_states
 
@@ -393,6 +400,7 @@ def main(args):
                     try:
                         collect = top_idx + 1 < num_mods
                         kld, states = forward_rows(top_idx, boundary[top_idx], collect_states = collect)
+                        row_klds_level = list(row_klds)
                     finally:
                         lin.inner.weight.copy_(saved)
                         del saved
@@ -413,6 +421,7 @@ def main(args):
                         draw = draw,
                         kld = kld,
                         inj_rfn = inj_rfn,
+                        **({"kld_rows": list(row_klds_level)} if args.row_klds else {}),
                     ))
                     res["w_norm"] = w_norm
                     print(f"    {lin.key:60} rfn {rfn_actual:.5f}   kld {kld:11.8f}   inj_rfn {inj_rfn:.6f}")
@@ -472,6 +481,7 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--rows", type = int, default = 10, help = "Number of eval rows, default: 10")
     parser.add_argument("-l", "--length", type = int, default = 1024, help = "Tokens per row, default: 1024")
     parser.add_argument("-d", "--device", type = int, default = 0, help = "CUDA device index")
+    parser.add_argument("-rk", "--row_klds", action = "store_true", help = "Also record every eval row's KL per tensor and level (kld_rows), for reweighting rows afterwards")
     parser.add_argument("-bc", "--boundary_cpu", action = "store_true", help = "Keep the cached per-module input states in host memory (more eval rows than fit the device beside the model)")
     parser.add_argument("-gs", "--gpu_split", type = str, default = None, help = "Comma-separated GB per device to autosplit the model across, instead of --device")
     parser.add_argument("-tr", "--trace", type = str, default = None, help = "Packed self-sampled trace (safetensors from sc_trace.py) to use as eval")
