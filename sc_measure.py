@@ -118,6 +118,10 @@ def main(args):
     # KL by content (raw text and code against the model's own chat), so a plain mean is set by the
     # loudest rows; recorded per row, a measurement can be reweighted afterwards without re-running
     row_klds = []
+    # Per-token KLs of the latest call, kept with --dump_positions: whether a row's KL is spread
+    # over its text or concentrated at a few positions (and which tokens those are)
+    row_pos = []
+    positions = {}
 
     @torch.inference_mode()
     def forward_rows(start_idx, states, collect_states = False):
@@ -128,6 +132,7 @@ def main(args):
         kld_sum = 0.0
         out_states = []
         row_klds.clear()
+        row_pos.clear()
         for r, state in enumerate(states):
             params = {}
             x = state.clone() if state.is_floating_point() else state
@@ -142,11 +147,16 @@ def main(args):
             # Chunk over tokens: full-vocab fp32 logits can be GBs
             x2 = x.view(-1, x.shape[-1])
             ref2 = ref.view(-1, ref.shape[-1])
-            kl_row, n_row = 0.0, 0
+            kl_row, n_row, pos = 0.0, 0, []
             for a in range(0, x2.shape[0], 256):
                 b = min(a + 256, x2.shape[0])
-                kl_row += compute_kl_div(x2[a:b].float(), ref2[a:b].to(x.device), kl_vocab).sum().item()
+                kl_tok = compute_kl_div(x2[a:b].float(), ref2[a:b].to(x.device), kl_vocab)
+                kl_row += kl_tok.sum().item()
                 n_row += b - a
+                if args.dump_positions:
+                    pos.append(kl_tok.float().cpu())
+            if args.dump_positions:
+                row_pos.append(torch.cat(pos))
             kld_sum += kl_row / n_row
             row_klds.append(kl_row / n_row)
             del x
@@ -401,6 +411,8 @@ def main(args):
                         collect = top_idx + 1 < num_mods
                         kld, states = forward_rows(top_idx, boundary[top_idx], collect_states = collect)
                         row_klds_level = list(row_klds)
+                        if args.dump_positions:
+                            positions[f"{lin.key}|{li}|{draw}"] = torch.stack(row_pos).half()
                     finally:
                         lin.inner.weight.copy_(saved)
                         del saved
@@ -473,6 +485,11 @@ def main(args):
     save()
     if args.out:
         print(f"\n -- Saved: {args.out}")
+    if args.dump_positions and args.out:
+        from safetensors.torch import save_file
+        pos_out = args.out.rsplit(".json", 1)[0] + ".positions.safetensors"
+        save_file({**positions, "input_ids": torch.cat([r[:, :args.length] for r in rows], 0).contiguous()}, pos_out)
+        print(f" -- Per-position KLs: {pos_out}")
 
 
 if __name__ == "__main__":
@@ -481,6 +498,7 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--rows", type = int, default = 10, help = "Number of eval rows, default: 10")
     parser.add_argument("-l", "--length", type = int, default = 1024, help = "Tokens per row, default: 1024")
     parser.add_argument("-d", "--device", type = int, default = 0, help = "CUDA device index")
+    parser.add_argument("-dp", "--dump_positions", action = "store_true", help = "Also save every scored token's KL per tensor and level (<out>.positions.safetensors, with the rows' input_ids)")
     parser.add_argument("-rk", "--row_klds", action = "store_true", help = "Also record every eval row's KL per tensor and level (kld_rows), for reweighting rows afterwards")
     parser.add_argument("-bc", "--boundary_cpu", action = "store_true", help = "Keep the cached per-module input states in host memory (more eval rows than fit the device beside the model)")
     parser.add_argument("-gs", "--gpu_split", type = str, default = None, help = "Comma-separated GB per device to autosplit the model across, instead of --device")
