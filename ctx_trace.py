@@ -707,8 +707,9 @@ def build_convs(sl, n, docs, loop_docs, rng, self_pool):
                           [{"role": "user", "content": w["text"]}], None))
     elif sl == "self":
         for c in rng.sample(self_pool, min(n, len(self_pool))):
-            convs.append(({"slice": sl, "kind": "self", "conversation": c},
-                          [{"role": "user", "content": CONVERSATIONS[c][0]}], None))
+            text = c["prompt"] if isinstance(c, dict) else CONVERSATIONS[c][0]
+            convs.append(({"slice": sl, "kind": "self", "conversation": c["id"] if isinstance(c, dict) else c},
+                          [{"role": "user", "content": text}], None))
     return convs
 
 
@@ -746,11 +747,17 @@ def main(args):
     lo, hi = args.doc_min, args.doc_max
     self_pool = list(range(len(CONVERSATIONS)))
     if args.self_from:
-        keep = {r["conversation"] for r in json.load(open(args.self_from))["rows"]}
-        self_pool = [c for c in self_pool if c in keep]
-        print(f" -- own-voice prompts restricted to the {len(self_pool)} used by {args.self_from}")
+        src_rows = json.load(open(args.self_from))["rows"]
+        if src_rows and "prompt" in src_rows[0]:
+            # prompts given as text: an own-voice set of its own, disjoint from CONVERSATIONS (which
+            # other pipelines -- EXL3-SC's sc_trace -- calibrate on in full)
+            self_pool = [{"id": r["id"], "prompt": r["prompt"]} for r in src_rows]
+        else:
+            keep = {r["conversation"] for r in src_rows}
+            self_pool = [c for c in self_pool if c in keep]
+        print(f" -- own-voice prompts restricted to the {len(self_pool)} given by {args.self_from}")
     if args.exclude_self:
-        used = {r["conversation"] for r in json.load(open(args.exclude_self))["rows"]}
+        used = {r["conversation"] for r in json.load(open(args.exclude_self))["rows"] if "conversation" in r}
         self_pool = [c for c in self_pool if c not in used]
         print(f" -- excluding {len(used)} own-voice prompts used by {args.exclude_self}")
 
