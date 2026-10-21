@@ -594,6 +594,10 @@ class VllmBackend:
         # FlashInfer's top-p kernel takes workspace vLLM's memory profiling does not count; on a
         # card filled to the edge it fails in warmup. The native sampler is equivalent
         os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+        # Workers must be spawned: CUDA is initialized in this process by then. vLLM switches to
+        # spawn itself only when it notices, which it did locally and not on the cloud images, where
+        # forked workers then failed
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         from vllm import LLM
         kw = dict(VLLM_DEFAULTS, **engine_args)
         kw.setdefault("tensor_parallel_size", torch.cuda.device_count())
