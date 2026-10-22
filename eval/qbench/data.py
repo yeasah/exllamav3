@@ -37,17 +37,23 @@ def sha_key(obj) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys = True).encode("utf-8")).hexdigest()[:16]
 
 
+# Written next to a model's weights to record how it was made; never read when loading it
+PROVENANCE_SIDECARS = {"calibration.json", "converter.json"}
+
+
 def source_stamp(path: str):
     """
     Modification stamp of a model source, so in-place requantization invalidates caches. Only
     model-content files participate: incidental churn (__pycache__, lock files, readmes) must
-    not re-key the reference and silently trigger a full recompute.
+    not re-key the reference and silently trigger a full recompute. Provenance sidecars are
+    churn too: no loader reads them, and rewriting one (a corrected recipe description, an
+    adopted converter identity) re-keyed every scored rung of a ladder.
     """
     try:
         if os.path.isdir(path):
             files = [
                 os.path.join(path, f) for f in os.listdir(path)
-                if f.endswith((".safetensors", ".gguf", ".json", ".py"))
+                if f.endswith((".safetensors", ".gguf", ".json", ".py")) and f not in PROVENANCE_SIDECARS
             ]
             return max((int(os.path.getmtime(f)) for f in files), default = 0)
         if path.endswith(".gguf"):
