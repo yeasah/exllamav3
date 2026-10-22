@@ -1157,7 +1157,8 @@ class TransformersBackend:
         """Dequantize a weight stored under its plain name with a weight_scale sidecar:
         ModelOpt NVFP4 (uint8-packed e2m1 nibble pairs low-first, fp8-e4m3 scale per group,
         fp32 global scale) when weight_scale_2 exists, else FP8 (e4m3 values; per-tensor
-        scalar for ModelOpt, [out, 1] channel scale for compressed-tensors float-quantized).
+        scalar for ModelOpt, [out, 1] channel scale or [out/128, in/128] block grid for
+        compressed-tensors float-quantized).
         FP8 with blockwise weight_scale_inv (DeepSeek-style 128x128 blocks; despite the name,
         dequantization MULTIPLIES by it) is handled first, as is the equivalent DeepSeek-V4
         "<stem>.scale" sidecar convention (fp8 128x128 grid on dense weights, [out, in/32]
@@ -1174,19 +1175,24 @@ class TransformersBackend:
             si = self._scale_float(self._read_shard(f"{name}_scale_inv"))
         elif name.endswith(".weight") and f"{name[:-len('.weight')]}.scale" in self.tensor_index:
             si = self._scale_float(self._read_shard(f"{name[:-len('.weight')]}.scale"))
-        if si is not None:
+        def blocks(sc):
             # Block grid of any rank: per-tensor scalar (Mistral-Small-4 dense weights),
-            # per-expert [E, 1, 1] on fused 3D expert stacks, or the 2D 128x128 DeepSeek grid
-            if si.ndim > 0:
-                assert si.ndim == w.ndim, f"{name}: scale rank {si.ndim} vs weight rank {w.ndim}"
+            # per-expert [E, 1, 1] on fused 3D expert stacks, the 2D 128x128 DeepSeek grid, or
+            # compressed-tensors' block strategy (llm-compressor FP8_BLOCK: [out/128, in/128])
+            if sc.ndim > 0:
+                assert sc.ndim == w.ndim, f"{name}: scale rank {sc.ndim} vs weight rank {w.ndim}"
                 for d in range(w.ndim):
-                    if si.shape[d] != w.shape[d]:
-                        bs = (w.shape[d] + si.shape[d] - 1) // si.shape[d]
-                        si = si.repeat_interleave(bs, dim = d).narrow(d, 0, w.shape[d])
-            return w.float() * si
+                    if sc.shape[d] != w.shape[d] and sc.shape[d] != 1:
+                        bs = (w.shape[d] + sc.shape[d] - 1) // sc.shape[d]
+                        sc = sc.repeat_interleave(bs, dim = d).narrow(d, 0, w.shape[d])
+            return sc
+        if si is not None:
+            return w.float() * blocks(si)
         scale = self._read_shard(f"{name}_scale").float()
         if scale.ndim == 1:
             scale = scale.unsqueeze(1)
+        if f"{name}_scale_2" not in self.tensor_index and scale.ndim == w.ndim:
+            return w.float() * blocks(scale)
         if f"{name}_scale_2" in self.tensor_index:
             ws2 = self._read_shard(f"{name}_scale_2").float()
             q = torch.stack([(w & 0xF).long(), (w >> 4).long()], dim = -1).flatten(1)
