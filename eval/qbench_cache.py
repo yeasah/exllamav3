@@ -44,7 +44,7 @@ def keys_from_project(project_file: str) -> dict:
     """Re-derive the cache keys a project implies: {key: description}."""
     import yaml
 
-    from qbench.data import resolve_project_paths, sha_key, source_stamp
+    from qbench.data import raw_data_key, resolve_project_paths, sha_key, source_identity
     from qbench.measure import BF16_ROUNDING_EPS, METRICS_VERSION
 
     with open(project_file, "r", encoding="utf8") as f:
@@ -53,14 +53,13 @@ def keys_from_project(project_file: str) -> dict:
 
     if project.get("test_trace"):
         return {}          # trace keys need the tokenized data; not worth loading here
-    data_key = sha_key({"v": 1, "test_data": project["test_data"],
-                        "tokenizer": project["tokenizer"]})
+    data_key = raw_data_key(project)
 
     def model_key(mspec, noise=False):
         options = {k: v for k, v in mspec.get("options", {}).items() if k != "streaming"}
         return sha_key({
-            "v": 1, "engine": mspec["engine"], "source": mspec["source"],
-            "options": options, "stamp": source_stamp(mspec["source"]),
+            "v": 1, "engine": mspec["engine"], **source_identity(mspec["source"]),
+            "options": options,
             "noise": BF16_ROUNDING_EPS if noise else 0,
         })
 

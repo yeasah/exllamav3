@@ -6,6 +6,7 @@ import hashlib
 import datetime
 import json
 import os
+import re
 import shutil
 import huggingface_hub
 
@@ -65,6 +66,34 @@ def source_stamp(path: str):
         return int(os.path.getmtime(path))
     except OSError:
         return 0
+
+
+HF_SNAPSHOT = re.compile(r"/models--([^/]+?)--([^/]+)/snapshots/([0-9a-f]{40})(?:/(.+))?$")
+
+
+def source_identity(path: str) -> dict:
+    """
+    What a model source is, for cache keys. Inside a Hugging Face hub cache the snapshot's repo
+    and commit are the identity: a snapshot never changes, while its path and mtimes change
+    whenever the cache is moved or re-downloaded (2026-10-15 and 2026-10-22, each re-keying
+    every reference and every bf16 logit). Anything else is a local path that can be rewritten
+    in place, identified by path and modification stamp as before (same fields, same keys).
+    """
+    m = HF_SNAPSHOT.search(os.path.normpath(path))
+    if m:
+        return {"hf": f"{m.group(1)}/{m.group(2)}", "commit": m.group(3), "file": m.group(4)}
+    return {"source": path, "stamp": source_stamp(path)}
+
+
+def tokenizer_identity(tok: dict) -> dict:
+    """The tokenizer spec as keyed: a resolved hub snapshot path stands as repo and commit"""
+    if "source" in tok and HF_SNAPSHOT.search(os.path.normpath(tok["source"])):
+        return {**{k: v for k, v in tok.items() if k != "source"}, "source": source_identity(tok["source"])}
+    return tok
+
+
+def raw_data_key(project: dict) -> str:
+    return sha_key({"v": 1, "test_data": project["test_data"], "tokenizer": tokenizer_identity(project["tokenizer"])})
 
 
 def save_tensors(filename: str, tensors: dict):
@@ -284,7 +313,7 @@ def get_test_ids(project: dict, cache: QCache):
     """
     td = project["test_data"]
     tok = project["tokenizer"]
-    key = sha_key({"v": 1, "test_data": td, "tokenizer": tok})
+    key = raw_data_key(project)
     tokens_file = cache.tokens_file(key)
 
     if os.path.exists(tokens_file):

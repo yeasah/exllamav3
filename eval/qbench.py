@@ -44,7 +44,9 @@ from qbench.data import (
     get_test_rows,
     resolve_project_paths,
     save_tensors,
+    raw_data_key,
     sha_key,
+    source_identity,
     source_stamp,
 )
 from qbench.engines import open_backend
@@ -78,7 +80,7 @@ def main(args):
         vocab_size = trace_vocab
         assert vocab_size, "test_trace file is missing vocab_size"
     else:
-        data_key = sha_key({"v": 1, "test_data": project["test_data"], "tokenizer": project["tokenizer"]})
+        data_key = raw_data_key(project)
         from exllamav3 import Config as Exl3Config, Tokenizer as Exl3Tokenizer
         vocab_size = Exl3Tokenizer.from_config(Exl3Config.from_directory(project["tokenizer"]["source"])).actual_vocab_size
 
@@ -98,9 +100,8 @@ def main(args):
         return sha_key({
             "v": 1,
             "engine": mspec["engine"],
-            "source": mspec["source"],
+            **source_identity(mspec["source"]),
             "options": options,
-            "stamp": source_stamp(mspec["source"]),
             "noise": BF16_ROUNDING_EPS if noise else 0,
             # Scoped key version for quantize arms. The exclusion above was sound while
             # `streaming` only chose how weights were fetched -- but once `quantize`
