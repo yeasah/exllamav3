@@ -1660,7 +1660,15 @@ class TransformersBackend:
             cfg = self.model.config
             tcfg = cfg if getattr(cfg, "hidden_size", None) else cfg.get_text_config()
             hidden = tcfg.hidden_size
-            head_dim = getattr(tcfg, "head_dim", None) or hidden // tcfg.num_attention_heads
+            # transformers >= 5.15 keeps per-layer attributes in per_layer_config and raises a
+            # RuntimeError (not AttributeError, so getattr's default does not catch it) on the
+            # global read; gemma-4 mixes 256 and 512. Buffer sizing takes the largest
+            # (docs/format-and-loading.md, "transformers 5.15: heterogeneous configs")
+            layers = getattr(tcfg, "per_layer_config", None)
+            if layers:
+                head_dim = max((getattr(lc, "head_dim", None) or 0) for lc in layers) or hidden // tcfg.num_attention_heads
+            else:
+                head_dim = getattr(tcfg, "head_dim", None) or hidden // tcfg.num_attention_heads
             free = torch.cuda.mem_get_info(self.device)[0]
             # A waiting row holds two hidden states (the layer input, and the embedding output
             # the base forward keeps as a local for the whole pass) and the rope cos/sin, which
