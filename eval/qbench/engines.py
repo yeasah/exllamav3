@@ -1677,15 +1677,40 @@ class TransformersBackend:
             # here at fp32 for models that keep them so. 60% of free memory, the rest for the
             # materialized module and the active row's transients
             per_token = 2 * hidden * torch.finfo(self.dtype).bits // 8 + 2 * head_dim * 4
-            budget = int(0.6 * free / per_token)
+            # Sliding-window attention makes transformers materialize each row's mask, [1, 1, L, L]
+            # bool, at the start of the forward, and a suspended row keeps it for the whole pass;
+            # a plain causal mask is skipped (is_causal). On gemma-4's swe slice that term, absent
+            # here, was 45 GB of a 47 GB card (2026-10-23). 2 bytes: the held mask plus the
+            # transient while it is built
+            mask_bytes = 2 if self._sliding_attention(tcfg) else 0
+            cost = lambda l: l * per_token + mask_bytes * l * l
+            limit = 0.6 * free
+        else:
+            cost = lambda l: l
+            limit = budget
         groups, cur, n = [], [], 0
         for i, l in enumerate(lens):
-            if cur and n + l > budget:
+            if cur and n + cost(l) > limit:
                 groups.append(cur); cur, n = [], 0
-            cur.append(i); n += l
+            cur.append(i); n += cost(l)
         if cur:
             groups.append(cur)
         return groups
+
+    @staticmethod
+    def _sliding_attention(tcfg) -> bool:
+        """Does any layer use sliding-window attention? Read defensively: on transformers >= 5.15 a
+        per-layer attribute raises a RuntimeError on the global read."""
+        for name in ("layer_types", "sliding_window"):
+            try:
+                v = getattr(tcfg, name, None)
+            except RuntimeError:
+                v = None
+            if name == "layer_types" and v and any("sliding" in str(t) for t in v):
+                return True
+            if name == "sliding_window" and v:
+                return True
+        return any(getattr(lc, "sliding_window", None) for lc in (getattr(tcfg, "per_layer_config", None) or []))
 
     def run(self, ids: torch.Tensor, callback, noise_eps: float = None, ranges: list = None):
         if self.streaming:
