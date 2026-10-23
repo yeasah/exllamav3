@@ -15,8 +15,41 @@ unquantized source, per tensor: rfn = ||W_q - W_ref||_F / ||W_ref||_F. Streams o
 module at a time from each model.
 """
 
+def constant(args):
+    """The same file, without a quantized model: every budgeted Linear of the unquantized one at
+    --constant (its error at K=2), the head at --head_k by the per-bit ratio. The trellis error is a
+    property of the converter, not of the model: probed rungs give 0.2617-0.2628 at K=2 for every
+    body tensor of a 9B and a 27B alike, and 1.973-1.984x per bit (2026-10-22, converter 1.4.9).
+    Re-probe after a converter change before trusting the constant."""
+    config_r = Config.from_directory(args.model_r)
+    model_r = Model.from_config(config_r)
+    def walk(mod, out):
+        out.append(mod)
+        for ch in getattr(mod, "modules", []):
+            walk(ch, out)
+    results = []
+    for m in model_r.modules:
+        tree = []
+        walk(m, tree)
+        for t in tree:
+            if not isinstance(t, Linear) or t.qmap is None:
+                continue
+            k = args.head_k if t.qbits_key == "head_bits" else 2
+            if t.qbits_key not in ("bits", "head_bits"):
+                continue
+            results.append(dict(key = t.key, K = k, qbits_key = t.qbits_key, numel = t.weights_numel(),
+                                rfn = args.constant / args.per_bit ** (k - 2), ref_norm = None))
+    with open(args.out, "w") as f:
+        json.dump(dict(model_q = None, model_r = args.model_r, constant = args.constant,
+                       per_bit = args.per_bit, results = results), f, indent = 2)
+    print(f" -- {len(results)} tensors at rfn {args.constant} (K=2), head at K={args.head_k}")
+    print(f" -- Saved: {args.out}")
+
+
 @torch.inference_mode()
 def main(args):
+    if args.constant is not None:
+        return constant(args)
     device = torch.device("cuda", args.device)
 
     config_q = Config.from_directory(args.model_q)
@@ -100,8 +133,14 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("-mq", "--model_q", type = str, required = True)
+    parser.add_argument("-mq", "--model_q", type = str, default = None)
     parser.add_argument("-mr", "--model_r", type = str, required = True)
     parser.add_argument("-d", "--device", type = int, default = 0)
     parser.add_argument("-o", "--out", type = str, required = True)
-    main(parser.parse_args())
+    parser.add_argument("--constant", type = float, default = None,
+                        help = "no probe: write every tensor at this K=2 error (see constant())")
+    parser.add_argument("--head_k", type = int, default = 5, help = "with --constant: the head's K")
+    parser.add_argument("--per_bit", type = float, default = 1.98, help = "with --constant: error ratio per bit")
+    args = parser.parse_args()
+    assert args.constant is not None or args.model_q, "-mq is required unless --constant"
+    main(args)
