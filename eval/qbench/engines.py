@@ -2565,9 +2565,22 @@ ENGINES = {
 }
 
 
+def ensure_weights(source: str):
+    """A hub snapshot resolved for its configs only (allow_patterns, so a fully cached series
+    downloads no weights) gets its weights here, the first time a model actually has to run"""
+    from .data import source_identity
+    ident = source_identity(source)
+    if "hf" in ident and ident["file"] is None and os.path.isdir(source) \
+            and not any(f.endswith((".safetensors", ".bin")) for f in os.listdir(source)):
+        import huggingface_hub
+        print(f" -- Fetching weights: {ident['hf']}@{ident['commit'][:12]}")
+        huggingface_hub.snapshot_download(repo_id = ident["hf"], revision = ident["commit"])
+
+
 def open_backend(mspec: dict, max_len: int, device: torch.device):
     engine = mspec["engine"]
     if engine not in ENGINES:
         raise ValueError(f"Unknown engine: {engine} (available: {', '.join(ENGINES)})")
+    ensure_weights(mspec["source"])
     print(f" -- Loading ({engine}): {mspec['source']}")
     return ENGINES[engine](mspec["source"], max_len, device, mspec.get("options", {}))
