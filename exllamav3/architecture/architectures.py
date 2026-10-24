@@ -7,6 +7,7 @@ from .decilm import DeciLMModel
 from .deepseek_v3 import DeepseekV3Model
 from .deepseek_v4 import DeepseekV4Model
 from .dflash import DFlashModel
+from .dflash2 import DFlash2Model
 from .dflash_laguna import DFlashLagunaModel
 from .dots1 import Dots1Model
 from .ernie4_5 import Ernie4_5Model
@@ -27,11 +28,15 @@ from .hcxvisionv2 import HCXVisionV2Model
 from .hy_v3 import HyV3Model
 from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
+from .kimi_linear import KimiLinearModel
+from .bailing_hybrid import BailingHybridModel
 from .laguna import LagunaModel
 from .lfm2 import Lfm2Model
 from .lfm2_moe import Lfm2MoeModel
+from .lfm2_vl import Lfm2VlTextModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
+from .mimo_v2 import MiMoV2Model
 from .minimax_m2 import MiniMaxM2Model
 from .ministral3 import Ministral3Model
 from .mistral import MistralModel
@@ -39,7 +44,7 @@ from .mistral3 import Mistral3Model
 from .mixtral import MixtralModel
 from .muse_glimmer import MuseGlimmerTextModel
 from .muse_glimmer_assistant import MuseGlimmerAssistantModel
-from .nemotronh import NemotronHModel
+from .nemotronh import NemotronHModel, NemotronHOmniModel
 from .olmo3 import Olmo3Model
 from .olmohybrid import OlmoHybridModel
 from .phi3 import Phi3Model
@@ -74,6 +79,7 @@ ARCHITECTURES = {
         DeepseekV3Model,
         DeepseekV4Model,
         DFlashModel,
+        DFlash2Model,
         DFlashLagunaModel,
         Dots1Model,
         Ernie4_5Model,
@@ -91,6 +97,8 @@ ARCHITECTURES = {
         Glm4MoeLiteModel,
         GlmMoeDsaModel,
         Glm5NextModel,
+        KimiLinearModel,
+        BailingHybridModel,
         GptOssModel,
         HCXVisionV2Model,
         HyV3Model,
@@ -99,8 +107,10 @@ ARCHITECTURES = {
         LagunaModel,
         Lfm2Model,
         Lfm2MoeModel,
+        Lfm2VlTextModel,
         LlamaModel,
         MiMoModel,
+        MiMoV2Model,
         MiniMaxM2Model,
         Ministral3Model,
         MistralModel,
@@ -109,6 +119,7 @@ ARCHITECTURES = {
         MuseGlimmerTextModel,
         MuseGlimmerAssistantModel,
         NemotronHModel,
+        NemotronHOmniModel,
         Olmo3Model,
         OlmoHybridModel,
         Phi3Model,

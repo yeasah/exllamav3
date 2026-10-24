@@ -295,10 +295,12 @@ compaction resolves ties in ascending global index order, identical to the legac
 static at::Tensor& dsa_topk_ws(int device)
 {
     static std::mutex mtx;
-    static std::map<int, at::Tensor> ws;
+    // Leaked: a static map would free its tensors from a static destructor at exit, after the CUDA
+    // allocator has gone (a cudaMallocAsync free at teardown terminates the process)
+    static auto* ws = new std::map<int, at::Tensor>();
     std::lock_guard<std::mutex> lock(mtx);
-    auto it = ws.find(device);
-    if (it == ws.end())
+    auto it = ws->find(device);
+    if (it == ws->end())
     {
         // Candidate indices + counts (int32) followed by candidate scores (half, same count
         // as indices; int-sized allocation keeps one flat buffer)
@@ -307,9 +309,22 @@ static at::Tensor& dsa_topk_ws(int device)
             {(int64_t) TOPK_SPLIT_MAX_R * TOPK_SPLIT_G * TOPK_SPLIT_MAX_KPAD * 3 / 2 + TOPK_SPLIT_MAX_R * TOPK_SPLIT_G},
             at::TensorOptions().dtype(at::kInt).device(at::Device(at::kCUDA, device))
         );
-        it = ws.emplace(device, std::move(t)).first;
+        it = ws->emplace(device, std::move(t)).first;
     }
     return it->second;
+}
+
+// Allocate the split workspace ahead of a graph capture over `scores_static` (the full-width score
+// static a captured top-k scans). The eager pass that precedes a capture may scan only the live
+// prefix of that static, below TOPK_SPLIT_MIN_T, and so never take the split path itself; without
+// this the replay-side split kernel would allocate its workspace under capture (cudaMalloc is not
+// permitted while a stream is capturing)
+void dsa_topk_prepare(const at::Tensor& scores_static, int k_pad)
+{
+    static const bool allow_split = [](){ const char* e = getenv("EXL3_DSA_TOPK_SPLIT"); return !(e && *e == '0'); }();
+    if (!allow_split || scores_static.dim() != 2) return;
+    if (scores_static.size(1) < TOPK_SPLIT_MIN_T || k_pad > TOPK_SPLIT_MAX_KPAD) return;
+    (void) dsa_topk_ws(scores_static.device().index());
 }
 
 template <bool VEC>
@@ -556,7 +571,7 @@ void dsa_topk_merge_kernel
     int total = 0;
     for (int g = 0; g < G; ++g) total += cnt_sh[g];
 
-    if (total > k)
+    if (total >= k)
     {
         // Pass 1: high-byte histogram over the candidates (all finite by construction)
         for (int g = 0; g < G; ++g)
@@ -703,6 +718,16 @@ void dsa_topk_gr
     int T = scores.size(1);
     int k_pad = indices.size(1);
     TORCH_CHECK(indices.size(0) == R && k <= k_pad, "dsa_topk: output shape mismatch");
+    TORCH_CHECK(k >= 0, "dsa_topk: negative k");
+    // k == 0 selects nothing: every output slot is padding. Otherwise selecting from an empty
+    // row is undefined (with a device-side T, the static width bounds every replay's T)
+    TORCH_CHECK(k == 0 || T > 0, "dsa_topk: top-k over an empty score row");
+    if (!R || !k_pad) return;
+    if (!k)
+    {
+        cuda_check(cudaMemsetAsync(indices.data_ptr(), 0xff, (size_t) R * k_pad * sizeof(int), stream));
+        return;
+    }
 
     const int* t_ptr_ = t_ptr ? (const int*) t_ptr.value().data_ptr() : nullptr;
     bool vec = scores.stride(0) % 8 == 0 && ((uintptr_t) scores.data_ptr()) % 16 == 0;
@@ -802,6 +827,15 @@ void dsa_topk_tile
     int k_pad = ws_idx.size(2);
     TORCH_CHECK(ws_idx.size(0) == R && ws_cnt.size(0) == R && ws_cnt.size(1) == G, "dsa_topk_tile: workspace rows/slots mismatch");
     TORCH_CHECK(slot >= 0 && slot < G && k <= k_pad && G <= TOPK_SPLIT_G, "dsa_topk_tile: bad slot / k");
+    TORCH_CHECK(k >= 0, "dsa_topk_tile: negative k");
+    if (!R) return;
+    // k == 0 (or an empty tile) contributes no candidates
+    if (!k)
+    {
+        cuda_check(cudaMemset2DAsync((int*) ws_cnt.data_ptr() + slot, ws_cnt.stride(0) * sizeof(int), 0,
+                                     sizeof(int), R, stream));
+        return;
+    }
     bool vec = scores.stride(0) % 8 == 0 && ((uintptr_t) scores.data_ptr()) % 16 == 0;
     dim3 grid(R, 1);
     if (vec)
@@ -845,6 +879,10 @@ void dsa_topk_merge_tiles
     int k_pad = ws_idx.size(2);
     TORCH_CHECK(out_idx.size(0) == R && out_idx.size(1) == k_pad && k <= k_pad && G <= TOPK_SPLIT_G,
                 "dsa_topk_merge_tiles: shape mismatch");
+    TORCH_CHECK(ws_scr.sizes() == ws_idx.sizes() && ws_cnt.dim() == 2 && ws_cnt.size(0) == R && ws_cnt.size(1) == G,
+                "dsa_topk_merge_tiles: workspace shape mismatch");
+    TORCH_CHECK(k >= 0, "dsa_topk_merge_tiles: negative k");
+    TORCH_CHECK(k == 0 || G > 0, "dsa_topk_merge_tiles: top-k over an empty set of tiles");
     half* os = nullptr;
     int* oc = nullptr;
     int oc_stride = 1;
@@ -861,6 +899,17 @@ void dsa_topk_merge_tiles
         TORCH_CHECK(out_cnt.value().dim() == 1 && out_cnt.value().size(0) == R, "dsa_topk_merge_tiles: bad out_cnt");
         oc = (int*) out_cnt.value().data_ptr();
         oc_stride = (int) out_cnt.value().stride(0);
+    }
+    if (!R) return;
+    // k == 0 selects nothing: every output slot is padding, no scores, zero counts
+    if (!k)
+    {
+        if (k_pad)
+            cuda_check(cudaMemset2DAsync(out_idx.data_ptr(), out_idx.stride(0) * sizeof(int), 0xff,
+                                         k_pad * sizeof(int), R, stream));
+        if (oc)
+            cuda_check(cudaMemset2DAsync(oc, oc_stride * sizeof(int), 0, sizeof(int), R, stream));
+        return;
     }
     dsa_topk_merge_kernel<<<R, TOPK_THREADS, 0, stream>>>
     (
