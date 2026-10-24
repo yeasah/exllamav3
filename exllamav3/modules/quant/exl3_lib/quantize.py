@@ -1574,6 +1574,10 @@ def damping_share(quant_args: dict) -> float:
     return r / (1.0 + r)
 
 
+#: Largest H W (bytes, fp32) refit_scales keeps resident; past it, H W is recomputed per column chunk
+REFIT_STORE_HW_MAX = 1 << 30
+
+
 def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, su: torch.Tensor, sv: torch.Tensor,
                  rounds: int = 2, chunk: int = 16384, damping: float = 0.0):
     """
@@ -1600,14 +1604,25 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
     Q = weight_q
     su = su.float().to(dev).view(k, 1)
     sv = sv.float().to(dev).view(1, n)
-    # H W once (streamed over columns), reused by both steps; den = trace(W H W^T)
-    HW = torch.empty((k, n), dtype = torch.float, device = dev)
+    # H W once (streamed over columns), reused by both steps; den = trace(W H W^T). Past REFIT_STORE_HW_MAX
+    # it is recomputed per column chunk instead of stored: whole it is a (k, n) fp32 tensor beside the fp32
+    # Q, 3.8 GiB each for a 248k-vocab head at k = 4096, and with the full-size (Q * HW) temporary below
+    # that ran a 16 GB card out of memory at lm_head. The streamed path sums b_ in chunks, so it differs
+    # from the stored one in the last bits; under the limit (every tensor but large-vocab heads) the
+    # stored path keeps conversions bit-identical
+    stream_hw = k * n * 4 > REFIT_STORE_HW_MAX
+    def hw(a, b):
+        return H @ cols(weight, a, b) if stream_hw else HW[:, a:b]
+    HW = None if stream_hw else torch.empty((k, n), dtype = torch.float, device = dev)
     den = 0.0
     for a in range(0, n, chunk):
         b = min(a + chunk, n)
         wc = cols(weight, a, b)
-        HW[:, a:b] = H @ wc
-        den += (wc * HW[:, a:b]).sum().item()
+        if stream_hw:
+            den += (wc * (H @ wc)).sum().item()
+        else:
+            HW[:, a:b] = H @ wc
+            den += (wc * HW[:, a:b]).sum().item()
     den_err = den
     if H_err is not H:
         den_err = 0.0
@@ -1629,18 +1644,30 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
         for a in range(0, n, chunk):
             b = min(a + chunk, n)
             HQ = H @ Q[:, a:b]
-            num[a:b] = (Q[:, a:b] * HW[:, a:b]).sum(0)
+            num[a:b] = (Q[:, a:b] * hw(a, b)).sum(0)
             dn[a:b] = (Q[:, a:b] * HQ).sum(0)
         c = torch.where(dn > 1e-30, num / dn.clamp(min = 1e-30), torch.ones_like(num))
-        Q = Q * c.view(1, n)
+        if stream_hw:
+            Q.mul_(c.view(1, n))      # in place: the caller takes the returned tensor in place of weight_q
+        else:
+            Q = Q * c.view(1, n)
         sv = sv * c.view(1, n)
         # input-side scales
         A = (Q @ Q.T) * H
-        b_ = (Q * HW).sum(1)
+        if stream_hw:
+            b_ = torch.zeros(k, device = dev)
+            for a in range(0, n, chunk):
+                b = min(a + chunk, n)
+                b_ += (Q[:, a:b] * hw(a, b)).sum(1)
+        else:
+            b_ = (Q * HW).sum(1)
         A.diagonal().add_(1e-6 * A.diagonal().mean())
         r = torch.linalg.solve(A, b_)
         r = torch.where(torch.isfinite(r) & (r > 0), r, torch.ones_like(r))
-        Q = Q * r.view(k, 1)
+        if stream_hw:
+            Q.mul_(r.view(k, 1))
+        else:
+            Q = Q * r.view(k, 1)
         su = su * r.view(k, 1)
     e_after = err(Q)
     return Q, su, sv, e_before, e_after
