@@ -139,6 +139,15 @@ def main(args):
     numel_g = [sum(r["numel"] for r in g) for g in groups]
     step = args.k_step
     k_group = [float(args.min_k) if step != 1 else int(args.min_k)] * len(groups)
+
+    # Half steps exist only below 4 bpw (1.5 / 2.5 / 3.5 are the only half-integer rates with kernel
+    # instances, and convert.py refuses any other), so -ks 0.5 steps by half bits up to 4 and by
+    # whole bits above it, as the converter's own allocation does (allocation.rate_next)
+    def up(k):
+        return k + (0.5 if step != 1 and k < 4 - 1e-9 else 1)
+
+    def down(k):
+        return k - (0.5 if step != 1 and k <= 4 + 1e-9 else 1)
     spent = args.min_k * sum_numel
     assert spent <= budget, f"target bitrate below min_k = {args.min_k}"
 
@@ -148,19 +157,22 @@ def main(args):
     heap = []
     for i, g in enumerate(groups):
         if args.min_k < args.max_k:
-            gain = kld_at_g(g, args.min_k) - kld_at_g(g, args.min_k + step)
-            heapq.heappush(heap, (-gain / numel_g[i], i, args.min_k + step))
+            nk = up(args.min_k)
+            gain = kld_at_g(g, args.min_k) - kld_at_g(g, nk)
+            heapq.heappush(heap, (-gain / (numel_g[i] * (nk - args.min_k)), i, nk))
     while heap:
         neg_density, i, next_k = heapq.heappop(heap)
-        if spent + numel_g[i] * step > budget:
+        cost = numel_g[i] * (next_k - k_group[i])
+        if spent + cost > budget:
             # Later increments for this group only get worse per bit; drop it and let smaller
             # groups keep filling the remainder
             continue
         k_group[i] = next_k
-        spent += numel_g[i] * step
+        spent += cost
         if next_k < args.max_k - 1e-9:
-            gain = kld_at_g(groups[i], next_k) - kld_at_g(groups[i], next_k + step)
-            heapq.heappush(heap, (-gain / numel_g[i], i, next_k + step))
+            nk = up(next_k)
+            gain = kld_at_g(groups[i], next_k) - kld_at_g(groups[i], nk)
+            heapq.heappush(heap, (-gain / (numel_g[i] * (nk - next_k)), i, nk))
 
     # Exchange repair: a group (especially a tied pair, whose increments are twice the size) can
     # be stranded at a low K when its next increment stops fitting the remaining budget while
@@ -176,15 +188,16 @@ def main(args):
         cands = []
         for j, h in enumerate(groups):
             if k_group[j] > args.min_k + 1e-9:
-                loss = kld_at_g(h, k_group[j] - step) - kld_at_g(h, k_group[j])
-                cands.append((loss / (numel_g[j] * step), loss, numel_g[j] * step, j))
+                freed = numel_g[j] * (k_group[j] - down(k_group[j]))
+                loss = kld_at_g(h, down(k_group[j])) - kld_at_g(h, k_group[j])
+                cands.append((loss / freed, loss, freed, j))
         cands.sort()
         best = None  # (kld improvement, promote group, [demote groups])
         for i, g in enumerate(groups):
             if k_group[i] >= args.max_k - 1e-9:
                 continue
-            gain = kld_at_g(g, k_group[i]) - kld_at_g(g, k_group[i] + step)
-            need = numel_g[i] * step - leftover
+            gain = kld_at_g(g, k_group[i]) - kld_at_g(g, up(k_group[i]))
+            need = numel_g[i] * (up(k_group[i]) - k_group[i]) - leftover
             demote, loss_sum = [], 0.0
             for _, loss, nj, j in cands:
                 if need <= 0:
@@ -202,15 +215,17 @@ def main(args):
         if best is None:
             break
         _, i, demote = best
-        k_group[i] += step
-        spent += numel_g[i] * step
+        spent += numel_g[i] * (up(k_group[i]) - k_group[i])
+        k_group[i] = up(k_group[i])
         for j in demote:
-            k_group[j] -= step
-            spent -= numel_g[j] * step
+            spent -= numel_g[j] * (k_group[j] - down(k_group[j]))
+            k_group[j] = down(k_group[j])
         exchanges += 1
     if exchanges:
         print(f" -- Exchange repair: {exchanges} move(s)")
 
+    # Whole rates as ints in the recipe (4, not 4.0), half rates as floats
+    k_group = [int(k) if float(k).is_integer() else k for k in k_group]
     k_assign = {r["key"]: k_group[i] for i, g in enumerate(groups) for r in g}
     achieved_bpw = spent / sum_numel
     pred_kld = sum(kld_at(r, k_assign[r["key"]]) for r in tensors)
