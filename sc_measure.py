@@ -210,9 +210,12 @@ class Target:
 
 
 def collect_targets(mod, group_kinds = "all"):
-    """group_kinds: "all" (below), "experts" (only the MoE routed experts are grouped; every
-    other Linear is its own target, keeping dense keys as ungrouped measurements had them) or
-    "none" (every Linear its own target, routed experts included).
+    """group_kinds: "all" (below), "experts" (a MoE layer's routed experts grouped per projection
+    type -- gate, up and down as three targets, keyed <experts>.gate_proj etc. so sc_optimize's
+    gate_proj+up_proj tie still binds the pair the fused w13 GEMM needs at one K, while down and the
+    pair can differ, and sensitivity can differ by projection type; every other Linear is its own
+    target, keeping dense keys as ungrouped measurements had them) or "none" (every Linear its own
+    target, routed experts included).
 
     Targets under one top-level module: the routed experts of each BlockSparseMLP as one
     grouped target (its routing gate and latent projections stay individual); the gate and up
@@ -243,7 +246,13 @@ def collect_targets(mod, group_kinds = "all"):
             group(m, "qkv", qkv)
         elif isinstance(m, GatedDeltaNet):
             group(m, "qkvz", [getattr(m, "qkv_proj", None), getattr(m, "z_proj", None)])
-        if isinstance(m, BlockSparseMLP) and group_kinds != "none":
+        if isinstance(m, BlockSparseMLP) and group_kinds == "experts":
+            for name, lins in (("gate_proj", m.gates), ("up_proj", m.ups), ("down_proj", m.downs)):
+                lins = [lin for lin in lins if lin is not None and lin.qmap is not None]
+                if lins:
+                    targets.append(Target(f"{m.key}.experts.{name}", lins, lins[0].qbits_key))
+                    grouped_ids.update(id(lin) for lin in lins)
+        elif isinstance(m, BlockSparseMLP) and group_kinds == "all":
             experts = [lin for lin in (m.gates + m.ups + m.downs) if lin is not None and lin.qmap is not None]
             if experts:
                 targets.append(Target(f"{m.key}.experts", experts, experts[0].qbits_key))
@@ -451,7 +460,7 @@ def main(args):
             num_grouped += t.grouped
     if num_grouped:
         print(f" -- {num_grouped} grouped target(s): " + (
-            "MoE routed experts per layer" if args.group == "experts" else
+            "MoE routed experts per layer and projection type" if args.group == "experts" else
             "MoE routed experts per layer, gate/up of dense MLPs and shared experts, attention q/k/v(/g), GDN qkv/z"))
 
     expected_keys = {t.key for targets in targets_by_idx.values() for t in targets}
@@ -937,7 +946,7 @@ if __name__ == "__main__":
     parser.add_argument("-gs", "--gpu_split", type = str, default = None, help = "Comma-separated GB per device to autosplit the model across, instead of --device (resident load)")
     parser.add_argument("-g", "--group", choices = ("all", "experts", "none"), default = "all",
                         help = "Grouped targets: all (default: MoE routed experts, dense gate/up, attention q/k/v(/g), GDN qkv/z), "
-                               "experts (only MoE routed experts), none (every Linear on its own)")
+                               "experts (only MoE routed experts, one target per layer and projection type), none (every Linear on its own)")
     loading = parser.add_mutually_exclusive_group()
     loading.add_argument("--load-mode", choices = ("auto", "resident", "streaming"),
                          default = "auto", help = "auto (default): check free VRAM before choosing full-model loading or streaming")
