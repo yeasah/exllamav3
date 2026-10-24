@@ -98,6 +98,7 @@ parser.add_argument("-d", "--devices", type = str, default = "0", help = "List o
 parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
 parser.add_argument("-cb", "--codebook", type = str, default = "mul1", help = "Codebook: mul1 (default), mcg or 3inst")
+parser.add_argument("-nhs", "--no_half_steps", action = "store_true", help = "Allocate in whole-bit steps only, as before 1.6.4: with the mul1 codebook the budgeted allocation and the --hq floors otherwise use the half-integer rates 1.5 / 2.5 / 3.5 below 4 bpw (explicit half-integer --head_bits, --mtp_bits and recipe entries are unaffected)")
 parser.add_argument("-hess", "--hessians", type = str, default = None, help = "Directory of precomputed per-tensor Hessians (<key>.safetensors with hin (in, in) and/or hout (out, out), square or packed upper triangle, and/or hout_diag, e.g. YAQA-style Kronecker factors from a separate gradient pass, see util/yaqa_hessians.py). Tensors with hin skip the calibration forward passes; tensors with hout use two-sided LDLQ")
 parser.add_argument("-h1", "--hessians_one_sided", action = "store_true", help = "With --hessians: keep the regular one-sided LDLQ for tensors that have hout, leaving the output side to --out_scales yaqa")
 parser.add_argument("-sh", "--scaled_hessian", action = "store_true", help = "Factor the calibration Hessian per tensor with the tensor's input channel scales folded in, so LDLQ's error feedback weights each row by what its error costs at the output (one more Cholesky per tensor; experimental)")
@@ -321,6 +322,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("hessians", False, ""),
         ("hessians_reg", False, 0.025),
         ("hessians_one_sided", False, False),
+        ("no_half_steps", False, False),
         ("scaled_hessian", False, False),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
@@ -1288,13 +1290,14 @@ def main(args, job_state):
         strategy, final_bpw = create_q_strategy_from_recipe(
             model, mtp_model, config, args["recipe_strategy"], args["head_bits"], args["mtp_bits"],
             vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
-            hq = hq, half_steps = args["codebook"] == "mul1",
+            hq = hq, half_steps = args["codebook"] == "mul1" and not args["no_half_steps"],
         )
     else:
         strategy, final_bpw = create_q_strategy(
             model, mtp_model, config, args["bits"], args["head_bits"], args["mtp_bits"], hq,
             vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
-            half_steps = args["codebook"] == "mul1",   # 1.5 / 2.5 / 3.5 bpw exist for the mul1 codebook only
+            # 1.5 / 2.5 / 3.5 bpw exist for the mul1 codebook only; --no_half_steps keeps whole-bit steps
+            half_steps = args["codebook"] == "mul1" and not args["no_half_steps"],
         )
     args["final_bits"] = round(final_bpw, 2)
     print(" -- Quantization strategy, summary:")

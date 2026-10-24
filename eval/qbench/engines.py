@@ -2569,7 +2569,9 @@ class VllmBackend:
         self.device = device
 
         from vllm import LLM
-        llm_kwargs = dict(options)
+        # Read every key through _Options, so open_backend does not report the whole pass-through
+        # set as "ignored options" (a dict() copy bypasses its tracking)
+        llm_kwargs = {k: options[k] for k in options}
         # Environment variables applied only while this engine is built. vLLM and
         # its plugins read a lot of behavior out of the environment at construction
         # time, and a project comparing two settings of one of those needs them to
