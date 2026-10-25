@@ -3,6 +3,7 @@ import sys, os
 import argparse
 import json
 import math
+import re
 import zlib
 from collections import defaultdict
 from contextlib import contextmanager
@@ -451,6 +452,8 @@ def main(args):
     num_grouped = 0
     for i in range(num_mods):
         for t in collect_targets(mods[i], args.group):
+            if args.only and not re.search(args.only, t.key):
+                continue
             if not streaming:
                 for lin in t.linears:
                     assert isinstance(lin.inner, LinearFP16), \
@@ -944,6 +947,9 @@ if __name__ == "__main__":
     parser.add_argument("-rk", "--row_klds", action = "store_true", help = "Also record every eval row's KL per tensor and level (kld_rows), for reweighting rows afterwards")
     parser.add_argument("-bc", "--boundary_cpu", action = "store_true", help = "Keep the cached per-module input states in host memory (more eval rows than fit the device beside the model)")
     parser.add_argument("-gs", "--gpu_split", type = str, default = None, help = "Comma-separated GB per device to autosplit the model across, instead of --device (resident load)")
+    parser.add_argument("--only", type = str, default = None,
+                        help = "Measure only the targets whose key matches this regex (diagnostics: e.g. a few tensors "
+                               "checked against a full-model ground truth). The output then covers only those keys")
     parser.add_argument("-g", "--group", choices = ("all", "experts", "none"), default = "all",
                         help = "Grouped targets: all (default: MoE routed experts, dense gate/up, attention q/k/v(/g), GDN qkv/z), "
                                "experts (only MoE routed experts, one target per layer and projection type), none (every Linear on its own)")

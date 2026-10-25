@@ -128,3 +128,30 @@ def get_file_calibration(args, tokenizer):
             raise ValueError(f"Calibration file {args['cal_data']}: row {i} is empty")
         out.append(packed[i : i + 1, :n].to(torch.long).contiguous())
     return out
+
+
+def pack_rows(stream: list, cols: int, bos_id: int | None = None, max_rows: int | None = None) -> list:
+    """Cut a token stream (conversations concatenated) into fixed-width rows. With bos_id -- a model whose
+    chat template starts every conversation with BOS -- the stream's BOS tokens are dropped and every row
+    starts with exactly one, as every inference context does. Plain cols-wide windows would start most rows
+    mid-conversation without it and carry it mid-row at each conversation boundary, both off-distribution
+    for a model that uses BOS as an attention sink (gemma: 226 of 250 calibration rows had no leading BOS).
+    Without bos_id, rows are plain windows, as before."""
+    if bos_id is None:
+        n = len(stream) // cols
+        return [stream[i * cols:(i + 1) * cols] for i in range(n if max_rows is None else min(n, max_rows))]
+    s = [t for t in stream if t != bos_id]
+    w = cols - 1
+    n = len(s) // w
+    return [[bos_id] + s[i * w:(i + 1) * w] for i in range(n if max_rows is None else min(n, max_rows))]
+
+
+def tail_windows(seq: list, cols: int, k: int, bos_id: int | None = None) -> list:
+    """The last k cols-wide windows of one sequence, in order, each ending where the next begins (the last at
+    the sequence's end). With bos_id, BOS is dropped from the sequence and each window starts with one,
+    as in pack_rows."""
+    if bos_id is None:
+        return [seq[len(seq) - (k - i) * cols:len(seq) - (k - i - 1) * cols] for i in range(k)]
+    s = [t for t in seq if t != bos_id]
+    w = cols - 1
+    return [[bos_id] + s[len(s) - (k - i) * w:len(s) - (k - i - 1) * w] for i in range(k)]

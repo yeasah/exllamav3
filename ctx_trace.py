@@ -870,7 +870,13 @@ def main(args):
         write_trace(source_trace, args, tokenizer, tv, rows, {"slice": "cal", "docs": purpose})
 
     # Pack: each conversational slice's streams into fixed-width rows, up to its row budget
-    from exllamav3.conversion.calibration_data import get_default_calibration
+    from exllamav3.conversion.calibration_data import get_default_calibration, pack_rows, tail_windows
+    # A model whose chat template opens every conversation with BOS gets one at the start of every row and
+    # nowhere else (pack_rows); one without (Qwen) packs exactly as before
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    if bos_id is None or not rows or not all(r["input_ids"][:1] == [bos_id] for r in rows):
+        bos_id = None
+    print(f" -- packing rows {'each opened with BOS ' + str(bos_id) if bos_id is not None else 'without BOS (template emits none)'}")
     group = lambda r: "ctx" if r["slice"].startswith("ctx") else r["slice"]
     packed, comp = [], {}
     if rows_for.get("agent"):
@@ -884,8 +890,7 @@ def main(args):
             k = min(2, len(seq) // C, rows_for["agent"] - len(agent_rows))
             if k <= 0:
                 continue
-            agent_rows += [torch.tensor(seq[len(seq) - (k - i) * C:len(seq) - (k - i - 1) * C], dtype = torch.long).unsqueeze(0)
-                           for i in range(k)]
+            agent_rows += [torch.tensor(w, dtype = torch.long).unsqueeze(0) for w in tail_windows(seq, C, k, bos_id)]
             sessions += 1
             langs[r.get("code_language", "?")] = langs.get(r.get("code_language", "?"), 0) + k
             if len(agent_rows) >= rows_for["agent"]:
@@ -904,13 +909,16 @@ def main(args):
             stream += seq
             if r.get("lang", "en") not in ("en", "") and set(r["lang"].split("+")) != {"en"}:
                 ml_tok += len(seq)
-            if len(stream) >= rows_for[g] * C:
+            # enough for the row budget: with BOS rows, cols - 1 non-BOS tokens each
+            usable = len(stream) - (stream.count(bos_id) if bos_id is not None else 0)
+            if usable >= rows_for[g] * (C - 1 if bos_id is not None else C):
                 break
-        n_rows = min(rows_for[g], len(stream) // C)
+        windows = pack_rows(stream, C, bos_id, rows_for[g])
+        n_rows = len(windows)
         if n_rows < rows_for[g]:
             print(f" !! slice {g}: only {n_rows} of {rows_for[g]} rows of material; raw rows fill the rest")
             rows_for["raw"] += rows_for[g] - n_rows
-        packed += [torch.tensor(stream[i * C:(i + 1) * C], dtype = torch.long).unsqueeze(0) for i in range(n_rows)]
+        packed += [torch.tensor(w, dtype = torch.long).unsqueeze(0) for w in windows]
         comp[g] = {"rows": n_rows, "ml_token_frac": round(ml_tok / max(1, len(stream)), 3)}
     default = get_default_calibration({"cal_rows": 250, "cal_cols": C}, tokenizer)
     n_default_random = 250 - sum(max(1, int(w / 135 * 250)) for w in (20, 20, 10, 10, 50, 5))
