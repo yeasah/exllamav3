@@ -69,8 +69,23 @@ def main(args):
         ak, ar = anchor[key]
         return ar * ratio ** (ak - k)
 
-    # Sensitivity: geometric mean of kld / rfn^alpha over measured levels
+    # Sensitivity: geometric mean of kld / rfn^alpha over measured levels; with --floor_fit, the slope s of
+    # kld = c + s * rfn^alpha through the two outermost levels, so a KL floor every perturbation pays
+    # regardless of size (MoE routing flips: on Qwen3.6-35B-A3B halving the noise cut KL only 1.2-1.35x)
+    # does not pass for sensitivity
+    floor_stats = []
     def sensitivity(r):
+        if args.floor_fit:
+            ls = sorted((l for l in r["levels"] if l["kld"] > 0), key = lambda l: l["rfn_actual"])
+            if len(ls) >= 2:
+                lo, hi = ls[0], ls[-1]
+                dr = hi["rfn_actual"] ** alpha - lo["rfn_actual"] ** alpha
+                if dr > 0:
+                    slope = (hi["kld"] - lo["kld"]) / dr
+                    floor = hi["kld"] - slope * hi["rfn_actual"] ** alpha
+                    floor_stats.append(floor / hi["kld"])
+                    # A slope at or below zero is noise under the floor: the least sensitive, never negative
+                    return max(slope, 1e-3 * hi["kld"] / hi["rfn_actual"] ** alpha)
         s, n = 0.0, 0
         for l in r["levels"]:
             if l["kld"] > 0:
@@ -93,6 +108,11 @@ def main(args):
 
     for r in tensors + head:
         r["S"] = sensitivity(r)
+    if floor_stats:
+        fs = sorted(floor_stats)
+        print(f" -- Floor fit: floor share of the top level's KLD, median {fs[len(fs) // 2]:.1%} "
+              f"(min {fs[0]:.1%}, max {fs[-1]:.1%}) over {len(fs)} tensors")
+    for r in tensors + head:
         if r["key"] not in anchor and args.rfn_ref:
             raise ValueError(f"{r['key']} missing from {args.rfn_ref}")
 
@@ -334,6 +354,9 @@ if __name__ == "__main__":
     parser.add_argument("-rr", "--rfn_ref", type = str, default = None, help = "Per-tensor quantization error anchors (rfn probe JSON)")
     parser.add_argument("-a", "--anchor", type = str, default = "2:0.292", help = "Global error anchor K:rfn if no --rfn_ref, default: 2:0.292")
     parser.add_argument("-br", "--bit_ratio", type = float, default = 1.96, help = "Quantization error amplitude ratio per bit, default: 1.96")
+    parser.add_argument("-ff", "--floor_fit", action = "store_true",
+                        help = "Sensitivity from the slope of kld = c + s * rfn^alpha (needs two noise levels and a pinned "
+                               "--alpha), discounting a KL floor every perturbation pays regardless of size (MoE routing)")
     parser.add_argument("-al", "--alpha", type = float, default = None, help = "Override scaling exponent (default: fit from measurement)")
     parser.add_argument("-all", "--alpha_low", type = float, default = None, help = "Scaling exponent for the curve below the anchor K (demotions to high noise, e.g. K=1); default: same as --alpha.")
     parser.add_argument("-mink", "--min_k", type = float, default = 1)
