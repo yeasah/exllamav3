@@ -73,8 +73,34 @@ def main(args):
     # kld = c + s * rfn^alpha through the two outermost levels, so a KL floor every perturbation pays
     # regardless of size (MoE routing flips: on Qwen3.6-35B-A3B halving the noise cut KL only 1.2-1.35x)
     # does not pass for sensitivity
+    # With --floor, the floor is measured instead of fitted: each tensor's KL at a tiny noise level
+    # (rfn ~0.001, where its genuine cost is ~1e-5 of the working level's) is subtracted from every
+    # measured level. On Qwen3.6-35B-A3B early-layer tensors paid 65-80% of their rfn 0.131 KL at
+    # rfn 0.001 and the same again at 0.0005, more than the two-point fit attributes to the floor
+    floors = None
+    if args.floor:
+        with open(args.floor, "r") as f:
+            fm = json.load(f)
+        floors = {}
+        for r in fm["results"]:
+            ks = [l["kld"] for l in r["levels"]]
+            floors[r["key"]] = sum(ks) / len(ks)
+        missing = [r["key"] for r in tensors + head if r["key"] not in floors]
+        if missing:
+            raise ValueError(f"{missing[0]} (and {len(missing) - 1} more) missing from {args.floor}")
+
     floor_stats = []
     def sensitivity(r):
+        if floors is not None:
+            fl = floors[r["key"]]
+            ls = [l for l in r["levels"] if l["kld"] > 0]
+            if ls:
+                top = max(ls, key = lambda l: l["rfn_actual"])
+                floor_stats.append(fl / top["kld"])
+                # A level at or under its floor is noise: the least sensitive, never negative
+                eps = 1e-3 * top["kld"] / top["rfn_actual"] ** alpha
+                s = sum(math.log(max((l["kld"] - fl) / l["rfn_actual"] ** alpha, eps)) for l in ls)
+                return math.exp(s / len(ls))
         if args.floor_fit:
             ls = sorted((l for l in r["levels"] if l["kld"] > 0), key = lambda l: l["rfn_actual"])
             if len(ls) >= 2:
@@ -110,7 +136,7 @@ def main(args):
         r["S"] = sensitivity(r)
     if floor_stats:
         fs = sorted(floor_stats)
-        print(f" -- Floor fit: floor share of the top level's KLD, median {fs[len(fs) // 2]:.1%} "
+        print(f" -- Floor {'measured' if floors is not None else 'fit'}: floor share of the top level's KLD, median {fs[len(fs) // 2]:.1%} "
               f"(min {fs[0]:.1%}, max {fs[-1]:.1%}) over {len(fs)} tensors")
     for r in tensors + head:
         if r["key"] not in anchor and args.rfn_ref:
@@ -357,6 +383,9 @@ if __name__ == "__main__":
     parser.add_argument("-ff", "--floor_fit", action = "store_true",
                         help = "Sensitivity from the slope of kld = c + s * rfn^alpha (needs two noise levels and a pinned "
                                "--alpha), discounting a KL floor every perturbation pays regardless of size (MoE routing)")
+    parser.add_argument("-fl", "--floor", type = str, default = None,
+                        help = "Measured KL floor: an sc_measure.py JSON at a tiny noise level (e.g. --rfn 0.001) over the "
+                               "same targets, rows and grouping, subtracted from every level; exclusive with --floor_fit")
     parser.add_argument("-al", "--alpha", type = float, default = None, help = "Override scaling exponent (default: fit from measurement)")
     parser.add_argument("-all", "--alpha_low", type = float, default = None, help = "Scaling exponent for the curve below the anchor K (demotions to high noise, e.g. K=1); default: same as --alpha.")
     parser.add_argument("-mink", "--min_k", type = float, default = 1)
@@ -367,4 +396,7 @@ if __name__ == "__main__":
                                "tensors independently. Default: k_proj+v_proj,gate_proj+up_proj")
     parser.add_argument("-o", "--out", type = str, required = True, help = "Output recipe (YAML)")
     parser.add_argument("-t", "--table", type = str, default = None, help = "Optionally save full predicted per-tensor per-K KLD table (JSON)")
-    main(parser.parse_args())
+    args = parser.parse_args()
+    if args.floor and args.floor_fit:
+        parser.error("--floor and --floor_fit are exclusive: the floor is either measured or fitted")
+    main(args)
