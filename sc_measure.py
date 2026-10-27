@@ -20,7 +20,8 @@ from exllamav3.modules.attn import Attention
 from exllamav3.modules.sliding_attn import SlidingAttention
 from exllamav3.modules.gated_delta_net import GatedDeltaNet
 from exllamav3.modules.quant.fp16 import LinearFP16
-from exllamav3.modules.quant.exl3_lib.quantize import finalize_capture_H, get_hadamard_dt, had_k
+from exllamav3.modules.quant.exl3_lib.quantize import finalize_capture_H, get_hadamard_dt, had_k, prepare_H_out
+from safetensors import safe_open
 from datasets import load_dataset
 
 """
@@ -512,7 +513,8 @@ def main(args):
                 rows = args.rows,
                 length = args.length,
                 draws = args.draws,
-                mode = "shaped" if args.shaped else "iid",
+                mode = ("shaped2" if args.hout else "shaped") if args.shaped else "iid",
+                hout = args.hout,
                 trace = args.trace,
                 h_rows = args.h_rows if args.shaped else None,
                 rfn_ref = args.rfn_ref,
@@ -621,6 +623,69 @@ def main(args):
             err_sq += (w[a:b].float() - saved[a:b].float()).square().sum().item()
         return saved, (err_sq / w_sq) ** 0.5, w_sq ** 0.5
 
+    def hout_file(lin):
+        """The --hout file holding an output-side factor for this Linear, or None"""
+        if not args.hout:
+            return None
+        p = os.path.join(args.hout, lin.key + ".safetensors")
+        if not os.path.isfile(p):
+            return None
+        with safe_open(p, framework = "pt") as f:
+            return p if "hout" in f.keys() else None
+
+    def unpack_sym(t, n):
+        # As convert_model.unpack_sym: packed upper triangle (row-major) or a full matrix
+        if t.dim() == 2:
+            return t.float()
+        assert t.dim() == 1 and t.numel() == n * (n + 1) // 2, "packed Hessian size"
+        out = torch.zeros((n, n), dtype = torch.float)
+        out[torch.ones((n, n), dtype = torch.bool).triu_()] = t.float()
+        out += out.triu(1).T
+        return out
+
+    def perturb_shaped2(lin, rfn, seed, L, su, path):
+        """
+        Two-sided LDLQ-shaped noise, for a conversion with an output-side factor (convert.py -hess):
+        dW = S_u P_k L_in'^-T eta L_out'^-1 P_n S_v, the quantizer's rotated error E_r = L_in'^-T D L_out'^-1
+        mapped back as the quantizer un-rotates its result. L_out' comes from prepare_H_out on the file's hout with
+        S_v = random signs (as the quantizer draws them) x the out_scales-like column weights perturb_shaped uses.
+        The right solve couples columns, so this works on the whole tensor in fp32 (dense tensors only: no
+        --hout file covers the head or fused experts).
+        """
+        w = lin.inner.weight                            # (k, n) = (in, out)
+        k, n = w.shape
+        assert L.shape[0] == k, f"{lin.key}: H dim {L.shape[0]} != in_features {k}"
+        assert k % had_k == 0 and n % had_k == 0
+        dev = w.device
+        with safe_open(path, framework = "pt") as f:
+            hout = unpack_sym(f.get_tensor("hout"), n)
+        W = w.float()
+        col_sq = W.square().sum(dim = 0)
+        w_sq = col_sq.sum().item()
+        col_scale = col_sq.sqrt()
+        col_scale /= col_scale.square().mean().sqrt().clamp(min = 1e-20)
+        col_scale.clamp_(min = 1e-4)
+        gen = torch.Generator(device = dev)
+        gen.manual_seed(seed)
+        signs = (torch.randn(n, generator = gen, device = dev).sign() + 1e-5).sign()
+        sv = (signs * col_scale).view(1, n)
+        L_out, _ = prepare_H_out(hout, sv, {}, False, dev)
+        del hout
+        had = get_hadamard_dt(had_k, dev, torch.float, 1.0 / math.sqrt(had_k))
+        x = torch.randn((k, n), generator = gen, device = dev, dtype = torch.float)
+        x = torch.linalg.solve_triangular(L.mT, x, upper = True, unitriangular = True)
+        x = torch.linalg.solve_triangular(L_out, x, left = False, upper = False, unitriangular = True)
+        del L_out
+        x = (had.T @ x.view(k // had_k, had_k, n)).view(k, n)
+        x *= su.view(k, 1).to(dev)
+        x = (x.view(k, n // had_k, had_k) @ had).view(k, n)
+        x *= sv
+        x *= rfn * math.sqrt(w_sq / x.square().sum().item())
+        saved = w.clone()
+        w.copy_((W + x).to(w.dtype))
+        err_sq = (w.float() - W).square().sum().item()
+        return saved, (err_sq / w_sq) ** 0.5, w_sq ** 0.5
+
     SAVED_ON_HOST_BYTES = 1 << 30      # grouped targets park their saved weights in host RAM past this
 
     @torch.inference_mode()
@@ -635,9 +700,13 @@ def main(args):
         for lin, rfn in zip(target.linears, per):
             seed = zlib.crc32(f"{lin.key}|{li}|{draw}".encode()) & 0x7fffffff
             shape_lin = shaping.get(lin.qmap) if args.shaped else None
+            hp = hout_file(lin) if shape_lin is not None else None
             if shape_lin is not None:
                 factors = tuple(t.to(lin.inner.weight.device) for t in shape_lin)
-                sv, rfn_actual, w_norm = perturb_shaped(lin, rfn, seed, *factors)
+                if hp is not None:
+                    sv, rfn_actual, w_norm = perturb_shaped2(lin, rfn, seed, *factors, hp)
+                else:
+                    sv, rfn_actual, w_norm = perturb_shaped(lin, rfn, seed, *factors)
                 del factors
             else:
                 shaped_all = False
@@ -964,6 +1033,7 @@ if __name__ == "__main__":
                         help = "Streaming: system RAM for pending fan-out states, in GB (default: half of what is available)")
     parser.add_argument("-tr", "--trace", type = str, default = None, help = "Packed self-sampled trace (safetensors from sc_trace.py) to use as eval")
     parser.add_argument("-sh", "--shaped", action = "store_true", help = "LDLQ-shaped noise from captured Hessians (recommended; extra capture pass)")
+    parser.add_argument("-ho", "--hout", type = str, default = None, help = "With --shaped: directory of output-side Hessian factors (util/yaqa_hessians.py, hout); tensors with one get two-sided LDLQ-shaped noise, as a conversion with -hess quantizes them")
     parser.add_argument("-hr", "--h_rows", type = int, default = 64, help = "Calibration rows for Hessian capture in shaped mode, default: 64")
     parser.add_argument("-rfn", "--rfn", type = str, default = "0.29,0.145", help = "Comma-separated global noise levels (relative weight Frobenius norm)")
     parser.add_argument("-rr", "--rfn_ref", type = str, default = None, help = "Per-tensor noise anchors from sc_rfn_probe.py JSON (overrides --rfn)")
@@ -971,4 +1041,7 @@ if __name__ == "__main__":
     parser.add_argument("-dr", "--draws", type = int, default = 1, help = "Noise draws per level, default: 1")
     parser.add_argument("-t", "--top", type = int, default = 15, help = "Top contributors to print")
     parser.add_argument("-o", "--out", type = str, default = None, help = "Output file (JSON), resumes if present")
-    main(parser.parse_args())
+    args = parser.parse_args()
+    if args.hout and not args.shaped:
+        parser.error("--hout shapes the noise from the captured input-side factor too: it needs --shaped")
+    main(args)
