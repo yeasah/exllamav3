@@ -770,6 +770,31 @@ def ldlq_2hess(
     return weight_q, encoded
 
 
+def clip_indefinite(H: torch.Tensor, floor: float, verbose: bool) -> torch.Tensor:
+    """
+    A regularized output factor that is still not positive definite, with its few offending eigenvalues raised to
+    `floor` and every other direction kept as measured. The factor is a sum of ~10^5-10^6 outer products in fp32; on
+    a model whose Fisher has one dominant direction (Qwen3.8-27B: top eigenvalue ~3400x the mean diagonal) the
+    accumulation leaves a handful of eigenvalues a few hundredths negative, past the regularization. block_ldl's
+    retries would then lift the whole spectrum by 0.05 a step, flattening a bulk whose median is ~0.1 (two or three
+    steps on every layer's linear_attn.out_proj and mlp.up_proj). A positive definite factor is returned unchanged.
+    """
+    if torch.linalg.cholesky_ex(H)[1].item() == 0:
+        return H
+    try:
+        e, V = torch.linalg.eigh(H)
+    except Exception as ex:
+        if ex.__class__.__name__ != "OutOfMemoryError" and "out of memory" not in str(ex):
+            raise
+        free_mem()
+        e, V = torch.linalg.eigh(H.cpu())
+    low = int((e < floor).sum().item())
+    print(f" !! H_out not positive definite: {low} of {e.numel()} eigenvalues (min {e[0].item():+.4f}) raised to {floor}")
+    H = ((V * e.clamp(min = floor)) @ V.T).to(H.device)
+    del V, e
+    return (H + H.T) / 2
+
+
 def prepare_H_out(H_out: torch.Tensor, sv: torch.Tensor, quant_args: dict, verbose: bool, device):
     """
     Output-side Hessian factor in the quantizer's rotated basis, with its block LDL factor. The rotated weight relates
@@ -783,7 +808,9 @@ def prepare_H_out(H_out: torch.Tensor, sv: torch.Tensor, quant_args: dict, verbo
     blockwise_preapply_had_r_(Ho, had_n)
     blockwise_preapply_had_l_(Ho, had_n)
     Ho /= Ho.diagonal().mean().clamp_min(1e-30)
-    Ho.diagonal().add_(quant_args.get("sigma_reg_out", quant_args.get("sigma_reg", 0.025)))
+    reg = quant_args.get("sigma_reg_out", quant_args.get("sigma_reg", 0.025))
+    Ho.diagonal().add_(reg)
+    Ho = clip_indefinite(Ho, reg, verbose)
     L_out, Ho = block_ldl(Ho, 16, quant_args, verbose)
     L_out.diagonal().fill_(0.0)
     return L_out.to(device), Ho.to(device)
