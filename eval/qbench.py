@@ -72,6 +72,11 @@ def main(args):
     cache = QCache(project["logit_cache"])
 
     ids, ranges, trace_vocab = get_test_rows(project, cache)
+    # Traces of short known answers ask for per-row answer metrics (recall_trace.py sets meta.per_row)
+    per_row = False
+    if project.get("test_trace"):
+        with open(project["test_trace"]) as f:
+            per_row = bool(json.load(f).get("meta", {}).get("per_row"))
     max_len = ids.shape[-1] + 64
     if project.get("test_trace"):
         data_key = sha_key({"v": 1, "test_trace": os.path.basename(project["test_trace"]),
@@ -144,7 +149,7 @@ def main(args):
     if ref_results is None or not os.path.exists(ref_meta):
         os.makedirs(ref_store, exist_ok = True)
         backend = open_backend(ref, max_len, device)
-        stats = DiffStats(ids, ranges, vocab_size, None)
+        stats = DiffStats(ids, ranges, vocab_size, None, per_row)
         conf_rows = []
         def ref_callback(r, logits, offset = 0):
             stats(r, logits, offset)
@@ -167,7 +172,7 @@ def main(args):
         floor_results = cache.load_results(floor_results_key)
         if floor_results is None:
             backend = open_backend(ref, max_len, device)
-            stats = DiffStats(ids, ranges, vocab_size, ref_store)
+            stats = DiffStats(ids, ranges, vocab_size, ref_store, per_row)
             backend.run(ids, stats, noise_eps = BF16_ROUNDING_EPS, ranges = ranges)
             floor_results = stats.results()
             floor_results.update(backend.info)
@@ -190,7 +195,7 @@ def main(args):
         res = cache.load_results(results_key)
         if res is None:
             backend = open_backend(mspec, max_len, device)
-            stats = DiffStats(ids, ranges, vocab_size, ref_store)
+            stats = DiffStats(ids, ranges, vocab_size, ref_store, per_row)
             backend.run(ids, stats, ranges = ranges)
             res = stats.results()
             res.update(backend.info)

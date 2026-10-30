@@ -448,6 +448,10 @@ class Exl3Backend:
         free_mem()
 
 
+STREAM_BATCH_ABOVE = 1024       # streaming rows past which equal-length rows batch (TransformersBackend)
+STREAM_BATCH_SIZE = 64
+
+
 class TransformersBackend:
     """
     HF backend. Default: full load via accelerate device_map. With options: {streaming: true},
@@ -1644,23 +1648,39 @@ class TransformersBackend:
         if ranges is not None:
             row_len = [max(n, rng[1]) for n, rng in zip(row_len, ranges)]
         num_rows = ids.shape[0]
+        # A thread per row holds a cuBLAS handle per row, which runs out in the low thousands. Past
+        # STREAM_BATCH_ABOVE rows (only short-row traces get there, e.g. recall_trace.py's) a "row" of
+        # the scheduler below is a batch of equal-length rows: no padding, so the same computation
+        batches = [[r] for r in range(num_rows)]
+        if num_rows > STREAM_BATCH_ABOVE:
+            by_len = {}
+            for r in range(num_rows):
+                by_len.setdefault(row_len[r], []).append(r)
+            batches = [rs[i:i + STREAM_BATCH_SIZE] for _, rs in sorted(by_len.items())
+                       for i in range(0, len(rs), STREAM_BATCH_SIZE)]
+        num_rows_all, num_rows = num_rows, len(batches)
 
         pb_state = {"n": 0}
         pb = ProgressBar("Streaming", len(hook_modules) + 1)
 
-        cv = threading.Condition()
+        # One condition per row on one lock: only the row whose turn it is has anything to do, and a
+        # single notify_all woke every row at each step, rows^2 x modules wakeups (a recall trace's
+        # 18,564 rows never finished its first module)
+        lock = threading.Lock()
+        cvs = [threading.Condition(lock) for _ in range(num_rows)]
         st = {"active": None, "turn": 0, "error": None}
         tls = threading.local()
 
         def fail(e):
             if st["error"] is None:
                 st["error"] = e
-            cv.notify_all()
+            for c in cvs:
+                c.notify_all()
 
         def pre_hook(module, args):
             me = id(module)
             load = False
-            with cv:
+            with lock:
                 while True:
                     if st["error"] is not None:
                         raise RuntimeError("layer-major streaming aborted")
@@ -1678,17 +1698,17 @@ class TransformersBackend:
                                 f"is active (a hooked module is invoked more than once "
                                 f"per forward, or rows take different paths)"))
                             raise RuntimeError("layer-major streaming aborted")
-                    cv.wait(1.0)
+                    cvs[tls.row].wait(30.0)
             # materialize outside the lock (heavy I/O); other rows keep waiting on "loading"
             try:
                 self._materialize(module)
             except Exception as e:
-                with cv:
+                with lock:
                     fail(e)
                 raise
-            with cv:
+            with lock:
                 st["active"] = me
-                cv.notify_all()
+                cvs[st["turn"]].notify_all()
 
         # PyTorch keeps a cuBLAS workspace per thread's handle (32 MiB on recent GPUs), and every
         # row here is its own live thread: 166 rows of a 200-session trace held 4.9 GiB of them,
@@ -1699,7 +1719,7 @@ class TransformersBackend:
 
         def post_hook(module, args, output):
             clear_workspaces()
-            with cv:
+            with lock:
                 st["turn"] += 1
                 if st["turn"] == num_rows:
                     self._dematerialize(module)
@@ -1707,13 +1727,16 @@ class TransformersBackend:
                     st["turn"] = 0
                     pb_state["n"] += 1
                     pb.update(pb_state["n"])
-                cv.notify_all()
+                cvs[st["turn"]].notify_all()
 
         hooks = []
         # Noise hooks first: they must fire inside the serialized window (before post_hook
         # advances the turn), since their torch.Generator is not thread-safe
         if noise_eps:
-            hooks += self._noise_hooks(noise_eps, lambda: (row_ids[tls.row] if row_ids is not None else tls.row))
+            def noise_row():
+                r = batches[tls.row][0]
+                return row_ids[r] if row_ids is not None else r
+            hooks += self._noise_hooks(noise_eps, noise_row)
         for m in hook_modules:
             hooks.append(m.register_forward_pre_hook(pre_hook))
             hooks.append(m.register_forward_hook(post_hook))
@@ -1724,12 +1747,12 @@ class TransformersBackend:
             try:
                 with torch.inference_mode(), torch.cuda.device(self.device):
                     tls.row = r
-                    part = ids[r:r + 1, :row_len[r]].to(self.device)
+                    part = ids[batches[r]][:, :row_len[batches[r][0]]].to(self.device)
                     out = base(input_ids = part, use_cache = False).last_hidden_state
                     hidden_cpu[r] = out.to("cpu")
                     del out
             except Exception as e:
-                with cv:
+                with lock:
                     fail(e)
 
         try:
@@ -1744,8 +1767,13 @@ class TransformersBackend:
                     raise st["error"]
 
                 self._materialize(head)
-                for r in range(num_rows):
-                    h = hidden_cpu[r]
+                results = {}
+                for b, rs in enumerate(batches):
+                    for i, r in enumerate(rs):
+                        results[r] = (b, i)
+                for r in range(num_rows_all):   # callbacks in row order, which the reference store keys on
+                    b, i = results[r]
+                    h = hidden_cpu[b][i:i + 1]
                     offset = 0
                     if ranges is not None:      # head is position-wise: score range only
                         offset = ranges[r][0]
@@ -1756,8 +1784,8 @@ class TransformersBackend:
                     if self.logit_softcap:
                         logits = torch.tanh(logits / self.logit_softcap) * self.logit_softcap
                     callback(r, logits, offset)
-                    hidden_cpu[r] = None
                 self._dematerialize(head)
+                hidden_cpu.clear()
                 pb.update(len(hook_modules) + 1)
         finally:
             for h in hooks:

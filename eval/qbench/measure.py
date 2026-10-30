@@ -30,8 +30,14 @@ class DiffStats:
     """Accumulates ppl over the model's own logits, and (if a reference store is given) KLD vs
     the reference, per-token, bucketed by the reference's top-token probability."""
 
-    def __init__(self, ids: torch.Tensor, ranges: list, vocab_size: int, ref_store: str | None):
+    def __init__(self, ids: torch.Tensor, ranges: list, vocab_size: int, ref_store: str | None,
+                 per_row: bool = False):
         self.ids = ids
+        # Per row: the scored tokens' total log-prob and whether each is the argmax, for this model
+        # and (with a reference store) the reference -- for traces whose rows are short known answers
+        # (recall_trace.py), where "does the quant still produce the reference's answer" is the metric
+        self.per_row = per_row
+        self.rows = {}
         self.ranges = ranges          # per row: (a, b) - score logits positions [a, b)
         self.vocab_size = vocab_size
         self.ref_store = ref_store
@@ -56,6 +62,10 @@ class DiffStats:
         self.logprob_sum += lp[finite].sum().item()
         self.logprob_count += finite.sum().item()
         self.total_count += targets.numel()
+        if self.per_row:
+            vs = min(self.vocab_size, logits.shape[-1])
+            hit = bool((logits[:, :-1, :vs].argmax(dim = -1) == targets).all())
+            self.rows[r] = {"lp": lp.sum().item(), "hit": hit}
 
         # kld vs reference
         if self.ref_store:
@@ -64,6 +74,10 @@ class DiffStats:
             vs = min(self.vocab_size, logits.shape[-1], ref.shape[-1])
             kl = compute_kl_div(logits.squeeze(0), ref.squeeze(0), vs)
             self.kl_toks.append(kl.flatten().float().cpu())
+            if self.per_row:
+                ref_lp = compute_target_log_probs(ref[:, :-1, :], targets, vs)
+                self.rows[r]["ref_lp"] = ref_lp.sum().item()
+                self.rows[r]["ref_hit"] = bool((ref[:, :-1, :vs].argmax(dim = -1) == targets).all())
             del ref
 
     def load_conf(self):
@@ -83,6 +97,15 @@ class DiffStats:
                 res["nonfinite_share"] = nf_share
         if self.logprob_count:
             res["ppl"] = math.exp(-self.logprob_sum / self.logprob_count)
+        if self.per_row and self.rows:
+            res["rows"] = [self.rows.get(r) for r in range(len(self.ranges))]
+            got = [x for x in res["rows"] if x and "ref_hit" in x]
+            known = [x for x in got if x["ref_hit"]]
+            if known:
+                # Over the rows the reference answers (argmax all the way): how many the model still does
+                res["recall_retained"] = sum(x["hit"] for x in known) / len(known)
+                res["recall_dlp"] = sum(x["lp"] - x["ref_lp"] for x in known) / len(known)
+                res["recall_known_rows"] = len(known)
         if self.kl_toks:
             self.load_conf()
             kl = torch.cat(self.kl_toks)
@@ -139,6 +162,8 @@ def print_stats(label: str, res: dict):
         line += f"   kld {res['kld']:.6f}   median {res['kld_median']:.6f}   p90 {res['kld_p90']:.6f}"
     if res.get("nonfinite_share"):
         line += f"   !! {100 * res['nonfinite_share']:.1f}% non-finite tokens excluded"
+    if "recall_retained" in res:
+        line += f"   recall {100 * res['recall_retained']:.1f}% of {res['recall_known_rows']} known, dlp {res['recall_dlp']:+.3f}"
     print(line)
     # Storage accounting has been silently wrong three times, always toward a plausible
     # number, so say it out loud rather than leaving it to be noticed in a plot later.
