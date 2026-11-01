@@ -31,6 +31,7 @@ POPQA_SHA256 = "9a5227f41bff0e4c331d4a774d946b12f95307892b58f860a9606ef356e6089b
 RELATIONS = ("capital", "capital of", "country", "place of birth", "father", "mother", "director", "author", "composer")
 
 INSTRUCTION = "Answer with only the name, nothing else."
+INSTRUCTION_FACTS = "Answer with only the answer, nothing else."
 
 
 def popqa(cache_dir):
@@ -50,7 +51,18 @@ def main(args):
     tokenizer = Tokenizer.from_config(config)
     tv = json.loads(args.template_vars)
     rows, questions = [], 0
-    for q in popqa(args.cache_dir):
+    if args.facts:
+        # recall_wikidata.py: one answer per question, with the relation, domain and subject sitelinks
+        with open(args.facts) as f:
+            for line in f:
+                q = json.loads(line)
+                msgs = [{"role": "user", "content": f"{q['question']} {INSTRUCTION_FACTS}"}]
+                prompt = tokenizer.hf_chat_template(msgs, add_generation_prompt = True, **tv)[0].tolist()
+                answer = tokenizer.encode(q["answer"], add_bos = False)[0].tolist()
+                rows.append({"input_ids": prompt, "response_ids": answer, "slice": "recall", "kind": q["relation"], "domain": q["domain"],
+                             "lang": "en", "qid": questions, "alias": 0, "answer": q["answer"], "s_pop": q["links"]})
+                questions += 1
+    for q in ([] if args.facts else popqa(args.cache_dir)):
         if q["prop"] not in RELATIONS:
             continue
         aliases = []
@@ -68,8 +80,8 @@ def main(args):
     out = {"model": args.model_dir, "vocab_size": tokenizer.actual_vocab_size, "template_vars": tv,
            "sampling": None,
            "meta": {"slice": "recall", "per_row": True, "rows": len(rows), "questions": questions,
-                    "source": f"PopQA ({POPQA_URL}, MIT)", "relations": list(RELATIONS),
-                    "instruction": INSTRUCTION, "max_aliases": args.max_aliases},
+                    "source": args.facts or f"PopQA ({POPQA_URL}, MIT)", "relations": None if args.facts else list(RELATIONS),
+                    "instruction": INSTRUCTION_FACTS if args.facts else INSTRUCTION, "max_aliases": args.max_aliases},
            "rows": rows}
     with open(args.output, "w") as f:
         json.dump(out, f)
@@ -83,6 +95,7 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output", required = True, help = "Trace JSON for qbench's test_trace")
     parser.add_argument("-tv", "--template_vars", default = '{"enable_thinking": false}',
                         help = "Chat template variables, JSON (default: thinking off)")
+    parser.add_argument("--facts", default = None, help = "Facts file from recall_wikidata.py, in place of PopQA")
     parser.add_argument("--max_aliases", type = int, default = 4, help = "Answer rows per question, canonical first")
     parser.add_argument("--cache_dir", default = os.path.expanduser("~/.cache/exllamav3/popqa"),
                         help = "Where the pinned PopQA file is kept")
