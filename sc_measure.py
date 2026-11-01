@@ -337,6 +337,7 @@ def main(args):
     runner = ModuleRunner(config, model.modules, device, streaming)
 
     total_rows = args.rows + (args.h_rows if args.shaped else 0)
+    score_mask = None
     if args.trace:
         # Packed self-sampled trace from sc_trace.py: in-distribution for the model,
         # and the same data the quantizer can calibrate on (convert.py --cal_data)
@@ -344,6 +345,10 @@ def main(args):
         data = load_file(args.trace)
         packed = data["input_ids"]
         lengths = data.get("lengths")     # per-row lengths (each row one example from position 0)
+        # Optional per-position mask over the eval rows: KL over the marked tokens only, e.g. the answers
+        # of question-answer turns, whose prompts would otherwise set the measurement. Long multi-turn rows
+        # rather than one row per question: a measurement costs per row, not per token
+        score_mask = data.get("score_mask")
         assert packed.shape[0] >= total_rows, \
             f"trace has {packed.shape[0]} rows, need {total_rows} (rows + h_rows)"
         assert lengths is not None or packed.shape[1] >= args.length, \
@@ -366,6 +371,9 @@ def main(args):
     def row_kld(r, x):
         """(mean KL of one row vs the reference, its per-token KLs on the host with --dump_positions)"""
         ref = ref_logits[r]
+        if score_mask is not None:
+            keep = score_mask[r, 1:x.shape[1]].nonzero().flatten().to(x.device) # logits at p - 1 predict token p
+            x, ref = x[:, keep], ref[:, keep.to(ref.device)]
         kl_vocab = min(vocab_size, x.shape[-1], ref.shape[-1])
         # Chunk over tokens: full-vocab fp32 logits can be GBs
         x2 = x.reshape(-1, x.shape[-1])
