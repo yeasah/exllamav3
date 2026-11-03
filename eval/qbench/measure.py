@@ -24,6 +24,31 @@ CONF_BUCKETS = [(0.00, 0.25), (0.25, 0.50), (0.50, 0.75), (0.75, 0.95), (0.95, 1
 # stored fp32 (fp16 flushed sub-6e-8 KLDs to zero, censoring the near-exact-reproduction tail
 # that in-domain trace data surfaces).
 METRICS_VERSION = 5
+# The same for per-row results alone, so that a recall field leaves every other cached KLD result standing. v2: kept,
+# bands and confident errors.
+PER_ROW_VERSION = 2
+
+
+#: Bands of how firmly the reference held an answer: name, lower and upper P
+RECALL_BANDS = (("sure", 0.9, 1.01), ("firm", 0.7, 0.9), ("leaning", 0.5, 0.7), ("shaky", 0.3, 0.5), ("barely", 0.0, 0.3))
+
+
+#: At or above this, a wrong token counts as the model stating something rather than leaning toward it
+CONFIDENT_P = 0.7
+
+
+def recall_kept(rows: list) -> float:
+    """Of the correct answers the reference would give under sampling, the share the model still gives. Per question,
+    so a gain on one cannot pay for a loss on another: a plain sum ratio rated 27B 3 bpw above 4 bpw."""
+    return sum(min(math.exp(x["lp"]), math.exp(x["ref_lp"])) for x in rows) / sum(math.exp(x["ref_lp"]) for x in rows)
+
+
+def first_wrong_p(logits: torch.Tensor, targets: torch.Tensor, vocab: int) -> float:
+    """How sure the model is of what it chose at the first answer token it gets wrong; 0 if it gets none wrong.
+    A low answer probability alone cannot tell a shrug from a confident wrong answer, and this can."""
+    top, chosen = logits[..., :vocab].softmax(dim = -1).max(dim = -1)
+    wrong = (chosen != targets).view(-1)
+    return top.view(-1)[wrong.nonzero()[0]].item() if wrong.any() else 0.0
 
 
 class DiffStats:
@@ -65,7 +90,7 @@ class DiffStats:
         if self.per_row:
             vs = min(self.vocab_size, logits.shape[-1])
             hit = bool((logits[:, :-1, :vs].argmax(dim = -1) == targets).all())
-            self.rows[r] = {"lp": lp.sum().item(), "hit": hit}
+            self.rows[r] = {"lp": lp.sum().item(), "hit": hit, "wrong_p": first_wrong_p(logits[:, :-1, :], targets, vs)}
 
         # kld vs reference
         if self.ref_store:
@@ -78,6 +103,7 @@ class DiffStats:
                 ref_lp = compute_target_log_probs(ref[:, :-1, :], targets, vs)
                 self.rows[r]["ref_lp"] = ref_lp.sum().item()
                 self.rows[r]["ref_hit"] = bool((ref[:, :-1, :vs].argmax(dim = -1) == targets).all())
+                self.rows[r]["ref_wrong_p"] = first_wrong_p(ref[:, :-1, :], targets, vs)
             del ref
 
     def load_conf(self):
@@ -106,6 +132,16 @@ class DiffStats:
                 res["recall_retained"] = sum(x["hit"] for x in known) / len(known)
                 res["recall_dlp"] = sum(x["lp"] - x["ref_lp"] for x in known) / len(known)
                 res["recall_known_rows"] = len(known)
+                # Damage is nothing like even across how firmly the reference held the answer, and no one
+                # figure keeps that: on MiniCPM5-2B a 3 bpw quant keeps 98% at the top band and 28% at the bottom
+                res["recall_bands"] = {}
+                for name, lo, hi in RECALL_BANDS:
+                    band = [x for x in known if lo <= math.exp(x["ref_lp"]) < hi]
+                    if band:
+                        res["recall_bands"][name] = {"rows": len(band), "retained": sum(x["hit"] for x in band) / len(band),
+                                                     "kept": recall_kept(band)}
+                res["recall_kept"] = recall_kept(known)
+                res["recall_confident_errors"] = sum(x["wrong_p"] >= CONFIDENT_P for x in known) / len(known)
         if self.kl_toks:
             self.load_conf()
             kl = torch.cat(self.kl_toks)
@@ -164,6 +200,9 @@ def print_stats(label: str, res: dict):
         line += f"   !! {100 * res['nonfinite_share']:.1f}% non-finite tokens excluded"
     if "recall_retained" in res:
         line += f"   recall {100 * res['recall_retained']:.1f}% of {res['recall_known_rows']} known, dlp {res['recall_dlp']:+.3f}"
+    if "recall_kept" in res:      # a noise floor cached before these fields has only the two above
+        line += f"   kept {100 * res['recall_kept']:.1f}%, confident errors {100 * res['recall_confident_errors']:.2f}%"
+        line += "   bands " + " ".join(f"{k} {100 * v['kept']:.1f}/{v['rows']}" for k, v in res["recall_bands"].items())
     print(line)
     # Storage accounting has been silently wrong three times, always toward a plausible
     # number, so say it out loud rather than leaving it to be noticed in a plot later.

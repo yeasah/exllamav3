@@ -53,6 +53,7 @@ from qbench.engines import open_backend
 from qbench.measure import (
     BF16_ROUNDING_EPS,
     METRICS_VERSION,
+    PER_ROW_VERSION,
     DiffStats,
     print_stats,
     save_reference_row,
@@ -144,7 +145,8 @@ def main(args):
     all_results = []
 
     # ------ Reference pass: cache logits + confidence, measure ppl
-    ref_results_key = f"{data_key}_{ref_key}_self_m{METRICS_VERSION}"
+    metrics_tag = f"m{METRICS_VERSION}" + (f"r{PER_ROW_VERSION}" if per_row else "")
+    ref_results_key = f"{data_key}_{ref_key}_self_{metrics_tag}"
     ref_results = cache.load_results(ref_results_key)
     if ref_results is None or not os.path.exists(ref_meta):
         os.makedirs(ref_store, exist_ok = True)
@@ -168,7 +170,7 @@ def main(args):
 
     # ------ Noise floor: reference engine + bf16-rounding noise per layer, vs cached logits
     if project.get("noise_floor", True) and ref["engine"] != "llamacpp":
-        floor_results_key = f"{data_key}_{ref_key}_{model_key(ref, noise = True)}_m{METRICS_VERSION}"
+        floor_results_key = f"{data_key}_{ref_key}_{model_key(ref, noise = True)}_{metrics_tag}"
         floor_results = cache.load_results(floor_results_key)
         if floor_results is None:
             backend = open_backend(ref, max_len, device)
@@ -191,7 +193,7 @@ def main(args):
     for mspec in models:
         if mspec is ref:
             continue
-        results_key = f"{data_key}_{ref_key}_{model_key(mspec)}_m{METRICS_VERSION}"
+        results_key = f"{data_key}_{ref_key}_{model_key(mspec)}_{metrics_tag}"
         res = cache.load_results(results_key)
         if res is None:
             backend = open_backend(mspec, max_len, device)

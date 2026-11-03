@@ -30,6 +30,9 @@ POPQA_SHA256 = "9a5227f41bff0e4c331d4a774d946b12f95307892b58f860a9606ef356e6089b
 # many-valued), screenwriter and producer (films often have several)
 RELATIONS = ("capital", "capital of", "country", "place of birth", "father", "mother", "director", "author", "composer")
 
+# Above any PopQA id, so that a pool of both sources keeps one id per question
+FACTS_QID_BASE = 10_000_000
+
 INSTRUCTION = "Answer with only the name, nothing else."
 INSTRUCTION_FACTS = "Answer with only the answer, nothing else."
 
@@ -51,6 +54,7 @@ def main(args):
     tokenizer = Tokenizer.from_config(config)
     tv = json.loads(args.template_vars)
     rows, questions = [], 0
+    next_id = FACTS_QID_BASE
     if args.facts:
         # recall_wikidata.py: one answer per question, with the relation, domain and subject sitelinks
         with open(args.facts) as f:
@@ -60,9 +64,10 @@ def main(args):
                 prompt = tokenizer.hf_chat_template(msgs, add_generation_prompt = True, **tv)[0].tolist()
                 answer = tokenizer.encode(q["answer"], add_bos = False)[0].tolist()
                 rows.append({"input_ids": prompt, "response_ids": answer, "slice": "recall", "kind": q["relation"], "domain": q["domain"],
-                             "lang": "en", "qid": questions, "alias": 0, "answer": q["answer"], "s_pop": q["links"]})
+                             "lang": "en", "qid": next_id, "alias": 0, "answer": q["answer"], "s_pop": q["links"]})
+                next_id += 1
                 questions += 1
-    for q in ([] if args.facts else popqa(args.cache_dir)):
+    for q in (popqa(args.cache_dir) if args.popqa or not args.facts else []):
         if q["prop"] not in RELATIONS:
             continue
         aliases = []
@@ -96,6 +101,7 @@ if __name__ == "__main__":
     parser.add_argument("-tv", "--template_vars", default = '{"enable_thinking": false}',
                         help = "Chat template variables, JSON (default: thinking off)")
     parser.add_argument("--facts", default = None, help = "Facts file from recall_wikidata.py, in place of PopQA")
+    parser.add_argument("--popqa", action = "store_true", help = "With --facts, PopQA too: a pool for recall_select.py")
     parser.add_argument("--max_aliases", type = int, default = 4, help = "Answer rows per question, canonical first")
     parser.add_argument("--cache_dir", default = os.path.expanduser("~/.cache/exllamav3/popqa"),
                         help = "Where the pinned PopQA file is kept")
