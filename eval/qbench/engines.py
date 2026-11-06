@@ -327,10 +327,19 @@ class Exl3Backend:
                 if self.embed_file and isinstance(module, Embedding):
                     from safetensors.torch import load_file
                     w = load_file(self.embed_file)["weight"]
-                    cur = module.embedding.weight
-                    assert w.shape == cur.shape, \
-                        f"embed_file {list(w.shape)} != checkpoint embedding {list(cur.shape)}"
-                    cur.data = w.to(cur.device, cur.dtype)
+                    if not hasattr(module.embedding, "weight"):
+                        # A quantized table (TableEmbedding: a trellis --embed_bits checkpoint) has
+                        # no weight to overwrite, so the lookup itself is replaced by a dense one
+                        rows, hidden = module.vocab_size, module.hidden_size
+                        assert tuple(w.shape) == (rows, hidden), \
+                            f"embed_file {list(w.shape)} != checkpoint embedding {[rows, hidden]}"
+                        module.embedding = torch.nn.Embedding(rows, hidden, _weight = w.to(self.device, torch.half), _freeze = True)
+                        module.caps.update({"prefer_cpu": False, "x_cpu": False})
+                    else:
+                        cur = module.embedding.weight
+                        assert w.shape == cur.shape, \
+                            f"embed_file {list(w.shape)} != checkpoint embedding {list(cur.shape)}"
+                        cur.data = w.to(cur.device, cur.dtype)
                     del w
 
                 if self.head_quant and isinstance(module, Linear) \
