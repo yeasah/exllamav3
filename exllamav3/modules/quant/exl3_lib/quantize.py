@@ -467,6 +467,17 @@ def blockwise_preapply_had_l_(x: torch.Tensor, had_dim):
         x[start:end, :] = block_transformed
 
 
+def preapply_had_r_(x: torch.Tensor, had_dim):
+    # In place, a GEMM-row chunk at a time (upstream 1.6.6): the out-of-place version holds an fp32 copy, the chunk
+    # list and their concatenation at once, ~3x the fp32 weight, which on a 248k-vocab head is the conversion's peak
+    k, n = x.shape
+    had = get_hadamard_dt(had_dim, x.device, torch.float, 1 / math.sqrt(had_dim))
+    rows = max(1, _HAD_MAX_GEMM_ROWS * had_dim // n)
+    for i in range(0, k, rows):
+        x[i:i + rows] = (x[i:i + rows].float().reshape(-1, had_dim) @ had).view(-1, n)
+    return x
+
+
 def blockwise_preapply_had_r_(x: torch.Tensor, had_dim):
     k, n = x.shape
     assert n % had_dim == 0
@@ -1877,7 +1888,7 @@ def quantize_exl3(
         weight_q = weight_q.to(device)
         weight_q = preapply_had_l(weight_q, had_k)
         weight_q *= su
-        weight_q = preapply_had_r(weight_q, had_n)
+        weight_q = preapply_had_r_(weight_q, had_n)
         weight_q *= sv
 
         # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference)
@@ -2175,7 +2186,7 @@ def quantize_exl3_batch(
                 wq = weight_qs[bi].to(device)
                 wq = preapply_had_l(wq, had_k)
                 wq *= su
-                wq = preapply_had_r(wq, had_n)
+                wq = preapply_had_r_(wq, had_n)
                 wq *= sv
                 H_orig = unrotate_H(Hd, H_datas[t]["su"])
                 _, su_f, sv_f, e_before, e_after = refit_scales(origs[t], wq, H_orig, su, sv,
