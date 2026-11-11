@@ -566,6 +566,15 @@ class TransformersBackend:
                     self.dequant_scaled = True
                     self.scale_block = tuple(q_get("weight_block_size", None) or ())
                     self.quant_desc = f"fp8 e4m3, scale blocks {'x'.join(map(str, self.scale_block)) or '128x128 (default)'}"
+                elif qm == "awq":
+                    # AutoAWQ GEMM: qweight/qzeros int32 with 8 nibbles each in AWQ's interleaved
+                    # order, fp16 scales per group, [in, out] orientation. Dequantized to bf16:
+                    # W4A16, which is how vLLM serves it (Marlin/AWQ kernels), up to accumulation order
+                    assert (q_get("version") or "gemm").lower() == "gemm", \
+                        f"Unsupported AWQ version: {q_get('version')}"
+                    self.awq_bits = q_get("bits", 4)
+                    self.awq_group = q_get("group_size", 128)
+                    self.quant_desc = f"awq gemm, {self.awq_bits}-bit, group {self.awq_group}"
                 elif qm == "mxfp4":
                     # gpt-oss-style: MoE expert tensors stored as <name>_blocks (packed fp4
                     # e2m1 pairs) + <name>_scales (e8m0); resolved per-tensor by sidecar
@@ -1206,6 +1215,27 @@ class TransformersBackend:
     def _nbytes(self, name):
         return self.tensor_nbytes[self.tensor_index[name][1]]
 
+    AWQ_SUFFIXES = ("qweight", "qzeros", "scales")
+    AWQ_REVERSE_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)   # AutoAWQ packs columns as 0,2,4,6,1,3,5,7
+
+    def _dequant_awq(self, stem):
+        """Dequantize an AutoAWQ GEMM weight to [out, in] float32: (q - zero) * scale per group of
+        input rows, both q and zero unpacked from int32 nibbles and put back in column order"""
+        bits, group = self.awq_bits, self.awq_group
+        shifts = torch.arange(0, 32, bits, dtype = torch.int32)
+        mask = (1 << bits) - 1
+        order = torch.arange(32 // bits).view(1, -1)[:, list(self.AWQ_REVERSE_ORDER)].view(-1)
+
+        def unpack(t):                                         # int32 [rows, cols/8] -> [rows, cols]
+            u = (t.unsqueeze(-1) >> shifts) & mask             # [rows, cols/8, 8], nibble k at shift 4k
+            return u[:, :, order].reshape(t.shape[0], -1)
+
+        q = unpack(self._read_shard(f"{stem}.qweight"))        # [in, out]
+        z = unpack(self._read_shard(f"{stem}.qzeros"))         # [in/group, out]
+        scale = self._read_shard(f"{stem}.scales").float()     # [in/group, out]
+        w = (q - z.repeat_interleave(group, dim = 0)).float() * scale.repeat_interleave(group, dim = 0)
+        return w.t().contiguous()
+
     def _dequant_ct(self, stem):
         """Dequantize a compressed-tensors pack-quantized weight: sequentially nibble-packed
         signed ints in int32 words, per-group scales, optional zero point"""
@@ -1355,7 +1385,8 @@ class TransformersBackend:
             return total
         if name.endswith(".weight"):
             stem = name[:-len(".weight")]
-            bits = [8 * self._nbytes(f"{stem}.{s}") for s in self.CT_SUFFIXES if f"{stem}.{s}" in self.tensor_index]
+            bits = [8 * self._nbytes(f"{stem}.{s}") for s in self.CT_SUFFIXES + self.AWQ_SUFFIXES
+                    if f"{stem}.{s}" in self.tensor_index]
             if bits:
                 return sum(bits)
         if f"{name}_blocks" in self.tensor_index:
@@ -1380,7 +1411,7 @@ class TransformersBackend:
             parts = ("down",) if kind == "down_proj" else ("gate", "up")
             pat = re.compile(
                 "^" + re.escape(prefix) + r"\.\d+\.(" + "|".join(parts) +
-                r")_proj\.weight(_packed|_scale|_scale_inv|_zero_point|_shape|_g_idx)?$")
+                r")_proj\.(weight(_packed|_scale|_scale_inv|_zero_point|_shape|_g_idx)?|qweight|qzeros|scales)$")
             total = sum(8 * self._nbytes(k) for k in self.tensor_index if pat.match(k))
             if total:
                 return total
@@ -1412,6 +1443,8 @@ class TransformersBackend:
         # compressed-tensors packed weight: nvfp4 when a global scale exists, int otherwise
         if name.endswith(".weight"):
             stem = name[:-len(".weight")]
+            if f"{stem}.qweight" in self.tensor_index:
+                return self._dequant_awq(stem)
             if f"{stem}.weight_packed" in self.tensor_index:
                 if f"{stem}.weight_global_scale" in self.tensor_index:
                     return self._dequant_ct_nvfp4(stem)
@@ -1427,7 +1460,8 @@ class TransformersBackend:
             probe = "down" if kind == "down_proj" else "gate"
             e = 0
             while (f"{prefix}.{e}.{probe}_proj.weight" in self.tensor_index or
-                   f"{prefix}.{e}.{probe}_proj.weight_packed" in self.tensor_index):
+                   f"{prefix}.{e}.{probe}_proj.weight_packed" in self.tensor_index or
+                   f"{prefix}.{e}.{probe}_proj.qweight" in self.tensor_index):
                 e += 1
             if e:
                 if kind == "down_proj":
@@ -1500,7 +1534,7 @@ class TransformersBackend:
         prefix = self.prefix[id(module)]
         sd = {}
         shims = []
-        for pn, _ in module.named_parameters():
+        for pn, param in module.named_parameters():
             full = f"{prefix}.{pn}" if prefix else pn
             if full not in self.tensor_index and full.endswith(".weight") \
                     and f"{full[: -len('.weight')]}.shard_0.weight" in self.tensor_index:
@@ -1509,7 +1543,14 @@ class TransformersBackend:
                 shims.append(pn)
                 continue
             t = self._get_tensor(full)
-            if t.is_floating_point() and not (t.dtype == torch.float32 and self._plain_fp32(full)):
+            keep_fp32 = t.dtype == torch.float32 and self._plain_fp32(full)
+            if keep_fp32 and getattr(self, "awq_bits", None) and param.dtype != torch.float32:
+                # AutoAWQ exporters store some unquantized tensors fp32 that the model keeps in its
+                # own dtype (QuantTrio's Qwen3.6-35B-A3B: every router, which then met bf16 hidden
+                # states). Scoped to AWQ so no other checkpoint's, nor the bf16 reference's,
+                # numerics move under a logit cache that does not key on this rule
+                keep_fp32 = False
+            if t.is_floating_point() and not keep_fp32:
                 t = t.to(self.device, self.dtype)
             else:
                 t = t.to(self.device)
