@@ -49,6 +49,7 @@ from qbench.data import (
     source_identity,
     source_stamp,
 )
+from qbench import engines
 from qbench.engines import open_backend
 from qbench.measure import (
     BF16_ROUNDING_EPS,
@@ -68,6 +69,7 @@ def main(args):
     with open(args.project, "r", encoding = "utf8") as f:
         project = yaml.safe_load(f)
     resolve_project_paths(project, args.project)
+    engines.NOISE_SALT = int(project.get("noise_salt", 0))
 
     device = torch.device("cuda", args.device)
     cache = QCache(project["logit_cache"])
@@ -109,6 +111,7 @@ def main(args):
             **source_identity(mspec["source"]),
             "options": options,
             "noise": BF16_ROUNDING_EPS if noise else 0,
+            **({"noise_salt": engines.NOISE_SALT} if noise and engines.NOISE_SALT else {}),
             # Scoped key version for quantize arms. The exclusion above was sound while
             # `streaming` only chose how weights were fetched -- but once `quantize`
             # existed, streaming was for a while the difference between a *quantized* and

@@ -46,6 +46,16 @@ HF_ROUTER_KEYS = (".mlp.gate.weight", ".block_sparse_moe.gate.weight", ".router.
 GGUF_ROUTER_KEYS = ("ffn_gate_inp.weight",)
 
 
+#: A second, independent noise-floor draw: 0 is the original seeding, and keys and caches are unchanged for it.
+#: Set from the project's `noise_salt` (qbench.py), for asking how much of a per-token floor is that one draw
+NOISE_SALT = 0
+
+
+def noise_seed(row: int, layer: int) -> int:
+    """The floor's noise seed for one row at one layer: keyed to both, so grouping and row order leave it unchanged"""
+    return 1 + 1_000_003 * row + layer + 1_000_000_007 * NOISE_SALT
+
+
 def apply_mult_noise(x: torch.Tensor, eps: float, gen: torch.Generator) -> torch.Tensor:
     n = torch.randn(x.shape, generator = gen, device = x.device, dtype = torch.float)
     return (x.float() * (1.0 + eps * n)).to(x.dtype)
@@ -419,7 +429,7 @@ class Exl3Backend:
                         x = x.clone()
                     if noise_eps and idx < len(modules) - 2 and x.is_floating_point():
                         # Keyed to (row, module), so grouping and row order leave it unchanged
-                        gen.manual_seed(1 + 1_000_003 * row_index[r] + idx)
+                        gen.manual_seed(noise_seed(row_index[r], idx))
                         x = apply_mult_noise(x, noise_eps, gen)
                     if logits_layer:
                         callback(r, x, offset)
@@ -1191,7 +1201,7 @@ class TransformersBackend:
                 g = gens.get(out.device)
                 if g is None:
                     g = gens[out.device] = torch.Generator(device = out.device)
-                g.manual_seed(1 + 1_000_003 * row_of() + li)
+                g.manual_seed(noise_seed(row_of(), li))
                 out = apply_mult_noise(out, noise_eps, g)
                 if isinstance(output, tuple):
                     return (out,) + output[1:]
