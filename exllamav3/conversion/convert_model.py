@@ -33,6 +33,18 @@ col_red = "\u001b[31;1m"
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
 
+
+def calibration_all_experts(model) -> bool:
+    """Whether calibration sends every token through every routed expert (the architecture's choice; Qwen3.5/3.6
+    MoEs and others say yes, so rarely-routed experts get a Hessian) or routes as inference does, so each expert's
+    Hessian is built from its own inputs. EXL3_CALIBRATION_ALL_EXPERTS=0 forces routing, =1 forces all; unset keeps
+    the architecture's setting. All-expert calibration gives every expert in a layer the layer's whole input
+    covariance, which on Qwen3.6-35B-A3B left the calibrated 4.00 behind the uncalibrated one on swe (2026-11-11)."""
+    env = os.environ.get("EXL3_CALIBRATION_ALL_EXPERTS")
+    if env is not None and env.strip() != "":
+        return env.strip() != "0"
+    return bool(model.calibration_all_experts)
+
 def monkeypatch_triton_autotuner_thread_safety():
     """
     Triton's Autotuner.run() stores the call's arguments as `self.nargs` on the shared
@@ -1007,7 +1019,7 @@ def capture_module_parallel(
                     "attn_mode": "flash_attn_nc",
                     "capture": captures[t_idx],
                     "capture_sens": captures_sens[t_idx],
-                    "activate_all_experts": model.calibration_all_experts,
+                    "activate_all_experts": calibration_all_experts(model),
                     "input_ids": original_input_ids[i],
                 }
                 if slicing:
@@ -1451,7 +1463,7 @@ def main(args, job_state):
                                     "attn_mode": "flash_attn_nc",
                                     "capture": capture_H,
                                     "capture_sens": capture_sens,
-                                    "activate_all_experts": model.calibration_all_experts,
+                                    "activate_all_experts": calibration_all_experts(model),
                                     "input_ids": original_input_ids[i],
                                 }
                                 if slicing:
