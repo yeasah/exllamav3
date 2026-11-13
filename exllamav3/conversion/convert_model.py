@@ -1021,6 +1021,7 @@ def capture_module_parallel(
                     "capture_sens": captures_sens[t_idx],
                     "activate_all_experts": calibration_all_experts(model),
                     "input_ids": original_input_ids[i],
+                    "cal_row": i,
                 }
                 if slicing:
                     params["q_mlp_slice"] = current_slice
@@ -1465,6 +1466,7 @@ def main(args, job_state):
                                     "capture_sens": capture_sens,
                                     "activate_all_experts": calibration_all_experts(model),
                                     "input_ids": original_input_ids[i],
+                                    "cal_row": i,
                                 }
                                 if slicing:
                                      params["q_mlp_slice"] = current_slice

@@ -624,12 +624,21 @@ class Linear(Module):
             # accumulation, and no diagonal damping can repair non-finite entries afterwards.
             # Drop the affected rows; the inf_nan counter above still reports them
             finite = torch.isfinite(x).all(dim = 1)
+            rw = params.get("capture_row_weight")       # sqrt of a per-row weight (expert calibration weighting)
             if not finite.all():
                 x = x[finite]
                 rows = x.shape[0]
+                if rw is not None:
+                    rw = rw[finite]
 
-            params["capture"][self.qmap]["H"].addmm_(x.T, x)
-            params["capture"][self.qmap]["count"] += rows
+            if rw is not None:
+                x.mul_(rw.unsqueeze(1))
+                # H is a weighted mean: normalized by the weights' sum, which finalize_capture_H divides by
+                params["capture"][self.qmap]["H"].addmm_(x.T, x)
+                params["capture"][self.qmap]["count"] += (rw.double() ** 2).sum().item()
+            else:
+                params["capture"][self.qmap]["H"].addmm_(x.T, x)
+                params["capture"][self.qmap]["count"] += rows
 
 
     @override

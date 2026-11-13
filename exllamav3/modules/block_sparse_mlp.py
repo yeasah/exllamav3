@@ -19,6 +19,27 @@ from .moe_batch_recon import PAD_MAX, worst_case_bytes
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
+
+# Content-weighted expert calibration (EXL3_CALIBRATION_EXPERT_WEIGHTS: a safetensors file with "labels",
+# int16 [cal rows, cols], a content-group label per calibration token, and "w.<module key>", float [groups,
+# experts], each expert's weight for each group). With every expert activated, an expert's Hessian becomes the
+# weighted mean of x x^T over all tokens, weighted by its own group weights: a routed expert's diet over the
+# groups at the all-expert pass's depth. Unset, calibration is unchanged.
+_cal_expert_w = None
+
+def _cal_expert_weights():
+    global _cal_expert_w
+    if _cal_expert_w is None:
+        path = os.environ.get("EXL3_CALIBRATION_EXPERT_WEIGHTS", "").strip()
+        if path:
+            from safetensors.torch import load_file
+            _cal_expert_w = load_file(path)
+            print(f" -- Content-weighted expert calibration: {path} "
+                  f"({sum(k.startswith('w.') for k in _cal_expert_w)} layers)")
+        else:
+            _cal_expert_w = {}
+    return _cal_expert_w
+
 from .block_sparse_mlp_routing import (
     RoutingCFG, ROUTING_ACT_SIGMOID, ROUTING_ACT_SQRTSP,
     routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
@@ -1302,6 +1323,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 max_count = 0
                 start = 0
 
+                # Content weighting: per token, sqrt of each expert's weight for the token's group
+                row_w = None
+                if "capture" in params and params.get("activate_all_experts") and params.get("cal_row") is not None:
+                    cw = _cal_expert_weights()
+                    if cw:
+                        wk = cw.get(f"w.{self.key}")
+                        assert wk is not None, f"EXL3_CALIBRATION_EXPERT_WEIGHTS has no weights for {self.key}"
+                        lab = cw["labels"][params["cal_row"]][:num_tokens].to(device = y.device, dtype = torch.long)
+                        assert lab.numel() == num_tokens, (lab.numel(), num_tokens)
+                        row_w = wk.to(y.device, torch.float)[lab].sqrt()          # [tokens, experts]
+                weighted = 0
+
                 # expert_count_list None: everything already handled by the fused kernel above
                 for expert_idx in range(num_ex if expert_count_list is not None else 0):
                     count = expert_count_list[expert_idx]
@@ -1370,11 +1403,22 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                     a = a.half()
                             return self.downs[exp_i].forward(a, params)
 
+                        if row_w is not None:
+                            exp_g = expert_idx if self.num_local_experts == self.num_experts \
+                                else expert_idx + self.routing_first
+                            params["capture_row_weight"] = row_w[top_x, exp_g]
+                            weighted += 1
                         current_state = mlp(expert_idx, current_state)
+                        params.pop("capture_row_weight", None)
 
                     current_state.mul_(w)
                     final_hidden_states.index_add_(0, top_x, current_state)
                     start = end
+
+                # Every expert must have taken the weighted path: one served by the fused or batched tiers
+                # would get an unweighted Hessian, silently
+                assert row_w is None or weighted == num_ex, \
+                    f"{self.key}: content weighting reached {weighted} of {num_ex} experts"
 
             final_hidden_states = final_hidden_states.reshape(eshape)
 
