@@ -39,7 +39,9 @@ def calibration_all_experts(model) -> bool:
     MoEs and others say yes, so rarely-routed experts get a Hessian) or routes as inference does, so each expert's
     Hessian is built from its own inputs. EXL3_CALIBRATION_ALL_EXPERTS=0 forces routing, =1 forces all; unset keeps
     the architecture's setting. All-expert calibration gives every expert in a layer the layer's whole input
-    covariance, which on Qwen3.6-35B-A3B left the calibrated 4.00 behind the uncalibrated one on swe (2026-11-11)."""
+    covariance; on Qwen3.6-35B-A3B it beat routed calibration on both scored slices, and leaning each expert
+    toward its own diet at full depth (EXL3_CALIBRATION_EXPERT_WEIGHTS) did not help either (the plugin's
+    docs/calibration.md, 2026-11-12 to -13)."""
     env = os.environ.get("EXL3_CALIBRATION_ALL_EXPERTS")
     if env is not None and env.strip() != "":
         return env.strip() != "0"
