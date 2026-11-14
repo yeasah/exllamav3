@@ -688,6 +688,8 @@ def generate_vllm(backend, config, tokenizer, convs, template_vars, max_new_toke
     return rows
 
 
+LOOP_ROUNDS = (2, 3)                         # tool rounds per loop conversation (--loop_rounds)
+
 def build_convs(sl, n, docs, loop_docs, rng, self_pool):
     convs = []
     if sl in ("ctx_user", "ctx_tool", "ctx_ml"):
@@ -697,8 +699,8 @@ def build_convs(sl, n, docs, loop_docs, rng, self_pool):
             convs.append(({"slice": sl, "kind": d["kind"], "lang": d["lang"], "ref": d["ref"]}, *builder(d, rng)))
     elif sl == "loop":
         pool = list(loop_docs)
-        while len(convs) < n and len(pool) >= 3:
-            take = [pool.pop() for _ in range(rng.randint(2, 3))]
+        while len(convs) < n and len(pool) >= LOOP_ROUNDS[1]:
+            take = [pool.pop() for _ in range(rng.randint(*LOOP_ROUNDS))]
             convs.append(({"slice": sl, "kind": "+".join(d["kind"] for d in take), "lang": "+".join(d["lang"] for d in take),
                            "ref": [d["ref"] for d in take]}, *conv_loop(take, rng)))
     elif sl == "swe":
@@ -779,7 +781,7 @@ def main(args):
             docs["ctx_ml"] = load_docs("ml", purpose, n, tokenizer, rng, lo, hi)
         loop_docs = []
         if "loop" in slices:
-            loop_docs = [d for k in prose for d in load_docs(k, purpose, per * 3, tokenizer, rng, lo // 2, hi // 2, args.code_glob)]
+            loop_docs = [d for k in prose for d in load_docs(k, purpose, per * LOOP_ROUNDS[1], tokenizer, rng, lo // 2, hi // 2, args.code_glob)]
             rng.shuffle(loop_docs)
         for sl in slices:
             convs = build_convs(sl, n, docs, loop_docs, rng, self_pool)
@@ -983,6 +985,8 @@ if __name__ == "__main__":
     parser.add_argument("--doc_min", type = int, default = 500, help = "Min document tokens")
     parser.add_argument("--doc_max", type = int, default = 1500, help = "Max document tokens")
     parser.add_argument("--max_new_tokens", type = int, default = 1536)
+    parser.add_argument("--loop_rounds", type = str, default = "2,3",
+                        help = "(eval) tool rounds per loop conversation, 'lo,hi' (e.g. 12,24 for agent-session-length contexts)")
     parser.add_argument("--seed", type = int, default = 0)
     parser.add_argument("-tv", "--template_vars", type = json.loads, default = {})
     parser.add_argument("--sampling", type = json.loads, default = None,
@@ -993,6 +997,7 @@ if __name__ == "__main__":
                                "each trace row records its mode")
     parser.add_argument("--fixed_template", action = "store_true", help = "(eval) use --template_vars for every conversation instead of varying thinking settings")
     args = parser.parse_args()
+    LOOP_ROUNDS = tuple(int(x) for x in args.loop_rounds.split(","))
     assert args.docs != "cal" or args.cal_out, "--docs cal needs --cal_out"
     assert not args.repack or args.docs == "cal", "--repack applies to --docs cal"
     SAMPLING = args.sampling
