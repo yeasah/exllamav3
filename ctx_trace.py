@@ -432,6 +432,28 @@ SWE_EVAL_GROUPS = ["openhands/minimax_m25/swe-rebench-v2", "sweagent/minimax_m25
 # repository the eval slice uses excluded (--exclude_swe_from)
 SWE_CAL_GROUPS = ["minisweagent/qwen38_27b/swe-rebench-v2"]
 SWE_EXCLUDE = frozenset()                # eval: repositories to skip (--exclude_swe_from)
+# The recorded agent's reasoning in a session's past turns (--swe_reasoning). "match" (default): kept when the
+# scored turn thinks, stripped when its template variables turn thinking off, so the history looks like the turn
+# being scored. Stripped under a thinking turn, the Qwen3.5/3.6 templates render every past turn with an empty
+# thought and then open a real one: Qwen3.6-35B-A3B came out malformed in 35% of those turns (a nested <think>,
+# an empty thought, or one never closed), Qwen3.5-4B in 93%, and the MoE's swe noise floor sat 5.8x wild's; kept,
+# 0% and wild's level (docs/qbench.md, "The swe slice: a format collision"). "keep" / "strip" force either.
+SWE_REASONING = "match"
+
+def thinking_on(template_vars) -> bool:
+    """Whether a conversation's template variables leave thinking on: only an explicit enable_thinking false
+    turns it off (templates without the switch ignore it, and a model that never thinks has no reasoning to
+    show for it -- its templates drop reasoning_content regardless)"""
+    return (template_vars or {}).get("enable_thinking", True) is not False
+
+def strip_reasoning(msgs):
+    return [{k: v for k, v in m.items() if k != "reasoning_content"} for m in msgs]
+
+def match_reasoning(msgs, template_vars):
+    """A swe conversation's history, given the template variables its scored turn renders with"""
+    if SWE_REASONING == "strip" or (SWE_REASONING == "match" and not thinking_on(template_vars)):
+        return strip_reasoning(msgs)
+    return msgs
 
 def load_swe(n, rng, tokenizer, template_vars, cap_tokens = 16000, min_turn = 5, groups = SWE_EVAL_GROUPS,
              min_tokens = 0, exclude_repos = frozenset()):
@@ -459,7 +481,9 @@ def load_swe(n, rng, tokenizer, template_vars, cap_tokens = 16000, min_turn = 5,
             tools = [json.loads(t) if isinstance(t, str) else t for t in r["tools"]]
             msgs = []
             for m in r["messages"]:
-                m = {k: v for k, v in m.items() if k != "reasoning_content" and v is not None}
+                # reasoning stays on the messages; match_reasoning() decides per conversation, once its
+                # template variables are known
+                m = {k: v for k, v in m.items() if v is not None}
                 for tc in m.get("tool_calls") or []:
                     f = tc.get("function", {})
                     if isinstance(f.get("arguments"), str):
@@ -788,6 +812,8 @@ def main(args):
             if variants and not args.fixed_template:
                 for meta, _, _ in convs:
                     meta["template_vars"] = rng.choice(variants)
+            if sl == "swe":
+                convs = [(meta, match_reasoning(msgs, meta.get("template_vars", tv)), tools) for meta, msgs, tools in convs]
             print(f" -- slice {sl}: {len(convs)} conversations", flush = True)
             rows = generate(generator, config, tokenizer, convs, tv, args.max_new_tokens, f"{args.seed}|{sl}")
             write_trace(f"{args.output}_{sl}.json", args, tokenizer, tv, rows, {"slice": sl, "docs": purpose})
@@ -851,7 +877,8 @@ def main(args):
         n_agent = int(-(-rows_for["agent"] // 2) * 1.3) + 1
         for w in load_swe(n_agent, rng, tokenizer, tv, groups = SWE_CAL_GROUPS, min_tokens = 2 * C, exclude_repos = eval_repos):
             convs.append(({"slice": "swe", "kind": "agent", "lang": "en", "repo": w["repo"], "code_language": w["language"],
-                           "instance_id": w["instance_id"], "cut": w["cut"], "group": w["group"]}, w["messages"], w["tools"]))
+                           "instance_id": w["instance_id"], "cut": w["cut"], "group": w["group"]},
+                          match_reasoning(w["messages"], tv), w["tools"]))
     if src:
         source_trace = src["source_trace"]
         rows = json.load(open(source_trace))["rows"]
@@ -985,6 +1012,9 @@ if __name__ == "__main__":
     parser.add_argument("--doc_min", type = int, default = 500, help = "Min document tokens")
     parser.add_argument("--doc_max", type = int, default = 1500, help = "Max document tokens")
     parser.add_argument("--max_new_tokens", type = int, default = 1536)
+    parser.add_argument("--swe_reasoning", type = str, default = "match", choices = ["match", "keep", "strip"],
+                        help = "the recorded agent's reasoning in a swe session's past turns: kept when the scored turn thinks "
+                        "(match, default), always (keep), or never (strip: traces before 2026-11-14)")
     parser.add_argument("--loop_rounds", type = str, default = "2,3",
                         help = "(eval) tool rounds per loop conversation, 'lo,hi' (e.g. 12,24 for agent-session-length contexts)")
     parser.add_argument("--seed", type = int, default = 0)
@@ -998,6 +1028,7 @@ if __name__ == "__main__":
     parser.add_argument("--fixed_template", action = "store_true", help = "(eval) use --template_vars for every conversation instead of varying thinking settings")
     args = parser.parse_args()
     LOOP_ROUNDS = tuple(int(x) for x in args.loop_rounds.split(","))
+    SWE_REASONING = args.swe_reasoning
     assert args.docs != "cal" or args.cal_out, "--docs cal needs --cal_out"
     assert not args.repack or args.docs == "cal", "--repack applies to --docs cal"
     SAMPLING = args.sampling
