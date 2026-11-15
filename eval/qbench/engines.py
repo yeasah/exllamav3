@@ -471,6 +471,27 @@ STREAM_BATCH_ABOVE = 1024       # streaming rows past which equal-length rows ba
 STREAM_BATCH_SIZE = 64
 
 
+def trust_remote_code(options: dict, source: str) -> bool:
+    """Whether to run code a checkpoint ships (its auto_map modeling/config files). Never by default: loading a
+    checkpoint to score it must not execute whatever its publisher put in it. A project opts in per model spec
+    with `trust_remote_code: true`, after reviewing that checkpoint's code; quant.py's --trust-remote-code REPO
+    sets it for one repo's arms only."""
+    trc = options.get("trust_remote_code", False)
+    if trc is not True and trc is not False:
+        raise ValueError(f"{source}: trust_remote_code must be true or false, got {trc!r}")
+    return trc
+
+
+def _remote_code_hint(e: Exception, source: str) -> Exception:
+    """A clearer failure for a checkpoint that needs its own code"""
+    if "trust_remote_code" in str(e):
+        return RuntimeError(f"{source} ships its own code and loading it needs trust_remote_code, which qbench never "
+                            f"enables by default. Review the checkpoint's code, then opt in for this model only: "
+                            f"`trust_remote_code: true` in its model spec's options (quant.py: --trust-remote-code "
+                            f"<repo>). Original error: {e}")
+    return e
+
+
 class TransformersBackend:
     """
     HF backend. Default: full load via accelerate device_map. With options: {streaming: true},
@@ -534,8 +555,11 @@ class TransformersBackend:
             import struct
             from accelerate import init_empty_weights
             from transformers import AutoConfig
-            trc = options.get("trust_remote_code", True)
-            config = AutoConfig.from_pretrained(source, trust_remote_code = trc)
+            trc = trust_remote_code(options, source)
+            try:
+                config = AutoConfig.from_pretrained(source, trust_remote_code = trc)
+            except ValueError as e:
+                raise _remote_code_hint(e, source) from e
 
             # Quantized checkpoints are dequantized on the fly by _get_tensor; the skeleton is
             # built unquantized (plain Linear modules), so the quantization config must not
@@ -770,27 +794,30 @@ class TransformersBackend:
                 self._quantize_streaming(source)
                 self.model.eval()
         else:
+            trc = trust_remote_code(options, source)
             try:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     source,
                     dtype = dtype,
                     device_map = options.get("device_map", "auto"),
-                    trust_remote_code = options.get("trust_remote_code", True),
+                    trust_remote_code = trc,
                 )
-            except ValueError:
+            except ValueError as e:
+                if "trust_remote_code" in str(e):
+                    raise _remote_code_hint(e, source) from e
                 from transformers import AutoModelForImageTextToText
                 self.model = AutoModelForImageTextToText.from_pretrained(
                     source,
                     dtype = dtype,
                     device_map = options.get("device_map", "auto"),
-                    trust_remote_code = options.get("trust_remote_code", True),
+                    trust_remote_code = trc,
                 )
             self.model.eval()
 
         self.settings = {
             "dtype": str(dtype).replace("torch.", ""),
             "streaming": self.streaming,
-            "trust_remote_code": options.get("trust_remote_code", True),
+            "trust_remote_code": trust_remote_code(options, source),
             # Requested vs what transformers actually installed on the model config
             "attn_implementation": f"{options.get('attn_implementation', 'eager' if self.streaming and getattr(self.model.config, 'auto_map', None) else 'default')}"
                                    f" (model: {getattr(self.model.config, '_attn_implementation', '?')})",
