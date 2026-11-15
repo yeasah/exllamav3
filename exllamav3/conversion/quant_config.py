@@ -12,8 +12,16 @@ def update_config(
     # unquantized embedding table (in system memory), so a model that tied them in the source is
     # untied in the output, and anything that trusts the flag (the transformers integration, other
     # loaders) must see it that way. Our own loaders only tie when the lm_head tensor is absent
-    if "tie_word_embeddings" in config_dict:
-        config_dict["tie_word_embeddings"] = False
+    # At every level: a multimodal config (Qwen3.5/3.6) keeps a second copy in text_config, which is what vLLM reads for
+    # the language model; left true, vLLM ties lm_head to an embedding that, as a trellis table, has no weight, and the
+    # checkpoint does not load (Qwen3.5-2B, 2026-11-15)
+    def untie(d):
+        if isinstance(d, dict):
+            if "tie_word_embeddings" in d:
+                d["tie_word_embeddings"] = False
+            for v in d.values():
+                untie(v)
+    untie(config_dict)
 
 
 def create_quantization_config_json(
