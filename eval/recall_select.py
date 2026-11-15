@@ -9,7 +9,11 @@ easy relations cannot carry a band, confident and unconfident questions are capp
 are the easy end, may fill at most --popqa_cap of either, and one relation at most --relation_cap.
 
 Scoring every arm against a slice costs far more than the reference pass that chooses it, so this is where a thin slice
-stops: under --min_questions confident ones (P >= --min_p) it writes nothing and exits 3, unless --allow_thin.
+stops: under --min_questions selected questions in all it writes nothing and exits 3, unless --allow_thin. Confidence
+does not decide thinness: a model that hedges holds most of what it knows below P 0.7, and retention there is as
+measurable as above it (Qwen3.5-2B: 172 confident of 1,108 selected, its slice within a point of its whole knowledge,
+2026-11-15). Bands under --min_band questions are marked thin, for the card to leave out. The reference's own knowledge
+profile -- its known answers by band, before caps -- is recorded beside the selection.
 
     python eval/recall_select.py -t recall_pool.json -r reference_results.json -o eval_recall.json
 """
@@ -21,6 +25,8 @@ import math
 import re
 import sys
 from collections import Counter, defaultdict
+
+from qbench.measure import RECALL_BANDS
 
 EXIT_THIN = 3
 
@@ -55,6 +61,10 @@ def capped(rows, pool, popqa_cap, relation_cap):
     return [r for v in by_relation.values() for r in v[:limit]]
 
 
+def band_of(p):
+    return next(name for name, lo, hi in RECALL_BANDS if lo <= p < hi)
+
+
 def select(pool, ref, min_p, popqa_cap, relation_cap):
     by_question = defaultdict(list)
     for i, row in enumerate(pool):
@@ -62,6 +72,7 @@ def select(pool, ref, min_p, popqa_cap, relation_cap):
     floor = math.log(min_p)
     numeric = known = 0
     confident, shaky = [], []
+    profile = Counter()
     for rows in by_question.values():
         i = max(rows, key = lambda r: ref[r]["ref_lp"])
         if not ref[i]["ref_hit"]:
@@ -71,8 +82,12 @@ def select(pool, ref, min_p, popqa_cap, relation_cap):
             numeric += 1
         else:
             (confident if ref[i]["ref_lp"] >= floor else shaky).append(i)
+            profile[band_of(math.exp(ref[i]["ref_lp"]))] += 1
+    total = sum(profile.values())
     return capped(confident, pool, popqa_cap, relation_cap), capped(shaky, pool, popqa_cap, relation_cap), {
-        "questions": len(by_question), "known": known, "numeric_known": numeric, "confident_uncapped": len(confident)}
+        "questions": len(by_question), "known": known, "numeric_known": numeric, "confident_uncapped": len(confident),
+        # what the reference knows, by how firmly: its known non-numeric answers per band, before caps
+        "profile": {name: profile[name] / total for name, _, _ in RECALL_BANDS} if total else {}}
 
 
 def main(args):
@@ -88,16 +103,22 @@ def main(args):
           f"{counts['confident_uncapped']} confident at P >= {args.min_p}; after caps {len(confident)} confident, {len(shaky)} below")
     print(f" -- confident by domain: {dict(domains.most_common())}")
     print(f" -- largest confident relations: {dict(relations.most_common(5))}")
-    if len(confident) < args.min_questions and not args.allow_thin:
-        print(f"!!! RECALL SLICE TOO THIN: {len(confident)} confident questions, {args.min_questions} required; nothing "
+    band_rows = Counter(band_of(math.exp(ref[i]["ref_lp"])) for i in kept)
+    band_rows = {name: band_rows[name] for name, _, _ in RECALL_BANDS}
+    thin_bands = [name for name, n in band_rows.items() if n < args.min_band]
+    print(f" -- the reference's known answers by band: " + "  ".join(f"{n} {v:.0%}" for n, v in counts["profile"].items()))
+    print(f" -- selected by band: {band_rows}" + (f"; under {args.min_band}, left off the card: {thin_bands}" if thin_bands else ""))
+    if len(kept) < args.min_questions and not args.allow_thin:
+        print(f"!!! RECALL SLICE TOO THIN: {len(kept)} questions, {args.min_questions} required; nothing "
               "written. Grow the pool, or pass --allow_thin to score it anyway")
         sys.exit(EXIT_THIN)
-    if len(confident) < args.min_questions:
-        print(f"!! recall slice is thin: {len(confident)} confident questions, {args.min_questions} wanted; written because of --allow_thin")
+    if len(kept) < args.min_questions:
+        print(f"!! recall slice is thin: {len(kept)} questions, {args.min_questions} wanted; written because of --allow_thin")
     trace["rows"] = [pool[i] for i in kept]
     trace["meta"].update({"rows": len(kept), "questions": len(kept), "selection": {
         **counts, "confident": len(confident), "below": len(shaky), "min_p": args.min_p, "popqa_cap": args.popqa_cap,
-        "relation_cap": args.relation_cap, "min_questions": args.min_questions, "thin": len(confident) < args.min_questions,
+        "relation_cap": args.relation_cap, "min_questions": args.min_questions, "thin": len(kept) < args.min_questions,
+        "min_band": args.min_band, "band_rows": band_rows, "thin_bands": thin_bands,
         "relations": dict(relations), "domains": dict(domains)}})
     with open(args.output, "w") as f:
         json.dump(trace, f)
@@ -112,6 +133,7 @@ if __name__ == "__main__":
     parser.add_argument("--min_p", type = float, default = 0.7, help = "Reference probability that counts as confident, toward --min_questions")
     parser.add_argument("--popqa_cap", type = float, default = 0.33, help = "Largest share PopQA may fill, of confident and of the rest")
     parser.add_argument("--relation_cap", type = float, default = 0.25, help = "Largest share one relation may fill, likewise")
-    parser.add_argument("--min_questions", type = int, default = 300, help = "Fewer confident questions than this is a refusal")
+    parser.add_argument("--min_questions", type = int, default = 300, help = "Fewer selected questions than this is a refusal")
+    parser.add_argument("--min_band", type = int, default = 30, help = "A confidence band with fewer questions is left off the card")
     parser.add_argument("--allow_thin", action = "store_true", help = "Write a slice under --min_questions anyway")
     main(parser.parse_args())
