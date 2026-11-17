@@ -287,10 +287,13 @@ class Exl3Backend:
         lens = [ranges[r][1] if ranges is not None else ids.shape[1] for r in range(ids.shape[0])]
         hidden = getattr(self.config, "hidden_size", None) or 4096
         per_token = hidden * 4                  # measured: 42.8 GiB / 2.2M tokens at hidden 5120
+        # Packed to a margin under the budget: each pass re-measures free memory after its setup, ~0.1-0.2 GiB
+        # lower, and a pass packed to the first figure landed just over the second about half the time
+        # (27B swe: 7.7 GiB packed, 7.5-7.6 measured), sending all of its states through host memory
         budget = self._state_budget()
         groups, cur, n = [], [], 0
         for i, l in enumerate(lens):
-            if cur and (n + l) * per_token > budget:
+            if cur and (n + l) * per_token > STATE_PACK_MARGIN * budget:
                 groups.append(cur); cur, n = [], 0
             cur.append(i); n += l
         if cur:
@@ -435,21 +438,33 @@ class Exl3Backend:
                         callback(r, x, offset)
                         states[r] = None
                     else:
-                        states[r] = x.cpu() if offload_states else x
+                        states[r] = x.cpu() if offload_states is not None and r >= offload_states else x
                     del x
 
                 if offload_states is None and not logits_layer and states[0] is not None and states[0].is_floating_point():
-                    total = sum(t.numel() * t.element_size() for t in states)
-                    offload_states = total > state_budget
-                    if offload_states:
-                        print(f" -- qbench: {total / 2**30:.1f} GiB of row states exceeds the "
-                              f"{state_budget / 2**30:.1f} GiB budget; keeping them in host memory between modules")
-                        states = [t.cpu() for t in states]
+                    # Rows stay on the device up to the budget and only the rest go to host memory: deciding for
+                    # the whole pass sent 7.6 GiB through PCIe on every module for a 0.1 GiB overshoot
+                    sizes = [t.numel() * t.element_size() for t in states]
+                    kept, acc = 0, 0
+                    for b in sizes:
+                        if acc + b > state_budget:
+                            break
+                        kept, acc = kept + 1, acc + b
+                    offload_states = kept
+                    if kept < len(states):
+                        print(f" -- qbench: {sum(sizes) / 2**30:.1f} GiB of row states exceeds the "
+                              f"{state_budget / 2**30:.1f} GiB budget; {len(states) - kept} of {len(states)} rows "
+                              f"({(sum(sizes) - acc) / 2**30:.1f} GiB) kept in host memory between modules")
+                        states = states[:kept] + [t.cpu() for t in states[kept:]]
                 module.unload()
                 self.config.stc.close()
                 free_mem()
                 pb.update(idx + 1)
 
+        if self.info is not None:
+            # Tallied on the first pass only (above): a later pass summed nothing, and writing its zeros here
+            # left every multi-pass run -- swe on large models -- with bpw 0 and vram 0
+            return
         tied_head = head_numel == 0
         if tied_head:
             # Tied embeddings: the head is served by the embedding matrix, so its bytes must
@@ -466,6 +481,9 @@ class Exl3Backend:
         self.model.unload()
         free_mem()
 
+
+#: run() packs rows into passes to this share of the state budget, leaving the pass room for what its own setup takes
+STATE_PACK_MARGIN = 0.9
 
 STREAM_BATCH_ABOVE = 1024       # streaming rows past which equal-length rows batch (TransformersBackend)
 STREAM_BATCH_SIZE = 64
