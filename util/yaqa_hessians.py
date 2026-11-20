@@ -132,13 +132,30 @@ def load_model(args, devices):
             d: max(int(torch.cuda.mem_get_info(d)[0] - r * 1024**3), 0)
             for d, r in zip(devices, reserve)
         }
+    def too_big():
+        # Offloaded layers keep their weights on the meta device, which the collectors read directly (weigh_by.norm()
+        # raised on them), and a MoE cannot even be offloaded to disk (transformers fuses its experts on load, so
+        # they would need re-saving): LFM2.5-8B-A1B over 2x16 GB at the default reserve hit both (2026-11-20)
+        caps = kwargs.get("max_memory", {})
+        return SystemExit(
+            f" !! The model does not fit on {', '.join(map(str, devices))} with --reserve_vram "
+            f"{args.reserve_vram or [8.0]} GB kept free per device ({sum(caps.values()) / 1024**3:.1f} GB left for "
+            f"weights), and the factor pass cannot run with offloaded layers: lower --reserve_vram or add devices"
+        )
     try:
         model = AutoModelForCausalLM.from_pretrained(args.model_dir, **kwargs)
-    except ValueError:
+    except ValueError as e:
+        if "offload" in str(e):
+            raise too_big() from e
+        # The image-text class is for multimodal checkpoints the causal-LM class cannot load; for anything else the
+        # first error is the real one, and retrying buried it under "Unrecognized configuration class"
+        from transformers import AutoConfig
+        from transformers.models.auto.modeling_auto import MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
+        if AutoConfig.from_pretrained(args.model_dir).model_type not in MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES:
+            raise
         model = AutoModelForImageTextToText.from_pretrained(args.model_dir, **kwargs)
-    offloaded = sorted(set(str(v) for v in getattr(model, "hf_device_map", {}).values() if v in ("cpu", "disk")))
-    if offloaded:
-        print(f" !! Model doesn't fit with the given --reserve_vram, part of it is offloaded to {'/'.join(offloaded)} (slow)")
+    if any(v in ("cpu", "disk") for v in getattr(model, "hf_device_map", {}).values()):
+        raise too_big()
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
