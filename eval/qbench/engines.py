@@ -2107,7 +2107,13 @@ def gguf_storage_info(source: str) -> dict:
 
 
 class LlamaCppBackend:
-    """llama-cpp-python with logits_all; storage info from the GGUF tensor table"""
+    """llama-cpp-python, asking llama.cpp for logits at the scored positions only; storage info from the GGUF tensor table.
+
+    With logits_all, every evaluated position's logits were computed, copied to the host and stored in a
+    [n_ctx, vocab] fp32 array: on swe, ~11.5k tokens of agent context ahead of a ~80-token scored response, about 1% of
+    them scored, and for a 262k vocabulary (gemma-4-12B) the array alone took ~50 GiB of host memory while the GPUs sat
+    at a third of their power (2026-11-20). The batch API takes a per-token logits flag; only flagged rows are computed
+    and returned."""
 
     def __init__(self, source: str, max_len: int, device: torch.device, options: dict):
         import llama_cpp
@@ -2131,7 +2137,7 @@ class LlamaCppBackend:
         }
         self.model = Llama(
             model_path = source,
-            logits_all = True,
+            logits_all = False,
             verbose = False,
             n_ctx = max_len,
             n_gpu_layers = options.get("n_gpu_layers", 999),
@@ -2146,6 +2152,36 @@ class LlamaCppBackend:
             "llama_cpp": getattr(llama_cpp, "__version__", "?"),
         }
 
+    def scored_logits(self, tokens: list, a: int):
+        """Logits at positions a..len(tokens)-1, [len - a, vocab] fp32: the row is decoded in n_batch chunks as
+        Llama.eval does, with the logits flag set only from position a on."""
+        import llama_cpp
+        import numpy as np
+        m = self.model
+        m.reset()
+        m._ctx.kv_cache_seq_rm(-1, 0, -1)
+        vocab = m.n_vocab()
+        out = np.empty((len(tokens) - a, vocab), dtype = np.float32)
+        batch = m._batch.batch
+        done = 0
+        for i in range(0, len(tokens), m.n_batch):
+            chunk = tokens[i : i + m.n_batch]
+            batch.n_tokens = len(chunk)
+            want = 0
+            for j, tok in enumerate(chunk):
+                batch.token[j] = tok
+                batch.pos[j] = i + j
+                batch.n_seq_id[j] = 1
+                batch.seq_id[j][0] = 0
+                batch.logits[j] = i + j >= a
+                want += i + j >= a
+            m._ctx.decode(m._batch)
+            if want:
+                rows = np.ctypeslib.as_array(llama_cpp.llama_get_logits(m._ctx.ctx), shape = (want * vocab,))
+                out[done : done + want] = rows.reshape(want, vocab)
+                done += want
+        return out
+
     def run(self, ids: torch.Tensor, callback, noise_eps: float = None, ranges: list = None):
         assert not noise_eps, "Noise injection not supported for llamacpp engine"
         with ProgressBar("Evaluating", ids.shape[0]) as pb:
@@ -2154,9 +2190,7 @@ class LlamaCppBackend:
                 # whole padded row as fp32 is [trace width, vocab], 10.5 GB for one row of a
                 # 17k-wide trace at Qwen's vocab, which ran a 16 GB card out of memory
                 a, b = ranges[r] if ranges is not None else (0, ids.shape[1])
-                self.model.reset()
-                self.model.eval(ids[r, :b].tolist())
-                logits = torch.from_numpy(self.model.scores[a:b]).unsqueeze(0).to(self.device)
+                logits = torch.from_numpy(self.scored_logits(ids[r, :b].tolist(), a)).unsqueeze(0).to(self.device)
                 callback(r, logits, a)
                 pb.update(r + 1)
 
