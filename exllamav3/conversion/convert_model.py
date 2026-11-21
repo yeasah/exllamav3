@@ -121,7 +121,7 @@ parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "Dep
 parser.add_argument("--max_module", type = int, help = "End quantization after this many modules, includes embedding and norm layers (for debug purposes)", default = None)
 
 group = parser.add_mutually_exclusive_group()
-group.add_argument("--out_scales", type = str, default = "auto", choices = ["auto", "always", "never", "yaqa"], help = "Output channel scales: always, never, auto (default): always, except for gate and up projections of gated MLPs whose calibration statistics predict a lower error without, or yaqa: per-channel scales that account for how much each output channel matters, from the diagonal of the output-side Hessians in --hessians (tensors without one are treated as in auto)")
+group.add_argument("--out_scales", type = str, default = None, choices = ["auto", "always", "never", "yaqa"], help = "Output channel scales: always, never, auto (default): always, except for gate and up projections of gated MLPs whose calibration statistics predict a lower error without, or yaqa: per-channel scales that account for how much each output channel matters, from the diagonal of the output-side Hessians in --hessians (tensors without one are treated as in auto)")
 
 parser.add_argument("--override_anyway", action = "store_true", help = "Allow resuming even when overriding settings that will break the existing job.")
 
@@ -364,8 +364,17 @@ def prepare(args) -> (dict, dict, bool, str):
     # Momentary args
     in_args["image_dump"] = args.image_dump
     in_args["verbose"] = args.verbose
-    in_args["apply_out_scales"] = {"always": True, "never": False, "auto": None, "yaqa": None}[args.out_scales]
-    in_args["out_scales_hessian"] = args.out_scales == "yaqa"
+    # Not momentary: it shapes every tensor the job writes. It was taken from each start's command line, so a resume
+    # without the flag converted the rest of the model at the default; it travels with the job now, and a resume that
+    # names it overrides (the old jobs recorded none, so theirs falls back to the default as before)
+    if args.out_scales is not None:
+        if args.resume and in_args.get("out_scales") not in (None, args.out_scales):
+            print(f" !! Warning: Overriding out_scales from existing job, was: {in_args['out_scales']}, "
+                  f"new value: {args.out_scales}")
+        in_args["out_scales"] = args.out_scales
+    in_args.setdefault("out_scales", "auto")
+    in_args["apply_out_scales"] = {"always": True, "never": False, "auto": None, "yaqa": None}[in_args["out_scales"]]
+    in_args["out_scales_hessian"] = in_args["out_scales"] == "yaqa"
     if in_args["out_scales_hessian"] and not in_args["hessians"]:
         return None, None, False, "--out_scales yaqa takes its output-side Hessians from --hessians"
     if in_args["hessians_one_sided"] and not in_args["hessians"]:
