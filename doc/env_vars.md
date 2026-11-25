@@ -182,17 +182,24 @@ affects quantized caches.
 - `1` - prefill staging (default): prefill chunks of 256+ tokens dequantize the referenced
   cache window once into a shared fp16 scratch and run the fp16 kernel over it, putting
   quantized-cache prefill within ~1–3% of fp16. Decode stays on the direct path. The scratch is
-  a per-call transient of one fixed size, the full cache at batch size 1
-  (`2 * max_num_tokens * num_kv_heads * head_dim` fp16 elements; QSA layers use their bounded
-  dense window instead), so the allocator sees the same request on every prefill chunk rather
-  than a size that grows with the context. The autosplit measuring pass budgets it, so the
-  space is accounted for at load time; loads with an explicit split map it at the first long
-  prefill. For very large caches this is the tradeoff to weigh against `0` (e.g. ~4 GB at
-  1M tokens with 8 kv heads of dim 128).
+  a per-call transient of one fixed size, `EXL3_QC_STAGING_PAGES` pages per sequence (default
+  256 = 64k tokens; QSA layers use their bounded dense window instead), and a window wider than
+  that is staged one block-table slice at a time into the same buffer, so the allocator sees the
+  same request on every prefill chunk rather than a size that grows with the context. The
+  autosplit measuring pass budgets it, so the space is accounted for at load time; loads with an
+  explicit split map it at the first long prefill.
 - `2` - full staging: legacy dequantize-then-attend path; whole cache layers are expanded into
   full-size fp16 temporaries before attention. Debug/A-B mode (same effect as the former
   `EXL3_QC_ATTN=0`); only affects decode if `EXL3_BC_ATTN` is also disabled, since the graphed
   decode path reads the packed cache directly.
+
+### `EXL3_QC_STAGING_PAGES` (default: `256`)
+
+The `EXL3_QC_STAGING=1` staging window, in pages of the quantized cache, per sequence. The fp16
+scratch (k and v) is a fixed allocation of this many pages — `2 * pages * page_size *
+num_kv_heads * head_dim` fp16 elements — and a window wider than that is staged one block-table
+slice at a time into the same buffer, merging the per-slice softmax state in a shared fp32
+accumulator. `0` is invalid: the window clamps to one page.
 
 ### `EXL3_QC_PF_TWO_PASS_MIN_Q` (default: `256`, `9` on Turing)
 
@@ -365,9 +372,17 @@ additionally stream their weights to the GPU and run there (via the fused kernel
 dequant, by size) while the CPU works the remaining tail. See `-mclt`/`-dmclt` below for 
 thread configuration, and the knobs below for tuning the split.
 
+`-mcs`/`--moe_cpu_split` (main model) and `-dmcs`/`--draft_moe_cpu_split` (draft model or MTP
+head) instead run the tail N routed experts of every eligible layer on the CPU. Each component
+takes one mode or the other, and N counts against that component's own number of routed experts
+per layer. A draft model or MTP head stays entirely on the GPU unless it is given a setting of
+its own.
+
 These knobs are collected in `exllamav3/model/moe_cpu_host.py`'s `MoeCpuTuning` class (read once
 from the environment at import); for a same-process sweep, mutate fields on the module-level
-`TUNING` singleton before constructing a model instead of setting env vars.
+`TUNING` singleton before constructing a model instead of setting env vars. Layout policy is an
+exception: set its environment flags before starting the parent and worker, and reload the model
+in fresh processes to change it.
 
 ### `EXL3_MOE_CPU_OFFLOAD` (default: `0`)
 
@@ -449,7 +464,7 @@ throughput on a Xeon Gold 6148. The `vbmi` tier
 without VBMI and stay on the `vnni` tier) is 15-70% faster than the dword scheme depending on
 bitrate. Never upgrades past what the CPU actually supports; unrecognized values are ignored.
 Read once per process (parent and worker independently), so it must be set before either is
-started. Note that capping below `bw` also disables the swizzled weight layout (see
+started. The `scalar` tier disables packed weight layouts; `avx2` has its own layout rules (see
 `EXL3_MOE_CPU_SWIZZLE`).
 
 ### `EXL3_MOE_CPU_WIDE` (default: `1`)
@@ -477,10 +492,33 @@ bands integer rates in groups of 2 and additionally repacks each tile's 32-bit w
 permutation a half-row's 8 source words then live in one AVX2 register, so every weight gather
 collapses to a single `vpermd` instead of walking the tile's registers, which removes the
 rate-proportional extraction cost of the native layout. Half-integer rates stay native on this
-tier. The `scalar` tier reads the native layout. The GPU-streaming prefill path restores the native
-tile and word order after each DMA, into a second VRAM ring allocated only when a layer's
+tier unless `EXL3_MOE_CPU_FRACTIONAL_SWIZZLE=1`. The `scalar` tier reads the native layout.
+The GPU-streaming prefill path restores native tile and word order after each DMA, into a
+second VRAM ring allocated only when a layer's
 experts arrive packed, so staged bytes reaching the GPU dequant are unaffected. Set to `0` to
 keep the native layout.
+
+Native AVX2 fractional kernels (1.5, 2.5 and 3.5 bpw) specialize batches of one, two or three
+prepared activation rows, including high/low pairs for wide activations. These kernels remain
+active with fractional packing off and need no new weight storage or allocation.
+
+### `EXL3_MOE_CPU_FRACTIONAL_SWIZZLE` (default: `0`)
+
+Only the literal value `1` enables this flag; all other values leave it disabled.
+
+Opt in to same-size group-2 packing with chronological 16-bit halfword planes for AVX2
+fractional experts (1.5, 2.5 and 3.5 bpw). Requires an active AVX2 tier;
+`EXL3_MOE_CPU_SWIZZLE=0` disables it even when this flag is `1`. Integer, scalar and AVX-512
+layout policy is unchanged. This lossless byte permutation does not change weight size,
+quantization or model quality, or retain an additional persistent expert copy.
+
+It can nevertheless increase VRAM use: the first packed layer on a device needs the existing
+native-order/inverse weight ring, `EXL3_MOE_CPU_WSLOTS * EXL3_MOE_CPU_WSLOT_MB` MiB
+(default **64 MiB per host/device**). A ring already allocated for packed integer experts is
+reused, not duplicated. Autosplit's measured load accounts for this allocation; otherwise it
+can first occur when packed experts stream to the GPU. This is why fractional packing is
+explicit and default-off. Set the flag before starting both parent and worker; changing this
+load-time policy requires fresh processes and a model reload.
 
 ### `EXL3_MOE_MEMOPS` (default: `1`)
 
@@ -630,10 +668,10 @@ side stream, and once the copy has landed the placement map sends later routes t
 least-used resident that was not routed goes the other way into the worker slot the promotion
 freed, so the resident set follows the conversation token by token instead of once per sweep, and
 no transfer reads the checkpoint or stops the worker. Needs the pinned arena because the parent
-process DMAs the expert bytes straight between the GPU slots and the worker's memory. Up to six
-promotions per step over all layers (one per layer), and as many demotions; the spares' own experts
-start in the worker. `EXL3_MOE_CPU_SWAP_DEBUG=1` prints the transfer counts, the hit rate and the
-step's bookkeeping cost every 128 steps.
+process DMAs the expert bytes straight between the GPU slots and the worker's memory. Up to
+`EXL3_MOE_CPU_PROMOTE_BUDGET` promotions per step over all layers (one per layer), and as many
+demotions; the spares' own experts start in the worker. `EXL3_MOE_CPU_SWAP_DEBUG=1` prints the
+transfer counts, the hit rate and the step's bookkeeping cost every 128 steps.
 
 Both dynamic modes save each layer's decayed expert selection counts to
 `~/.cache/exllamav3/expert_stats/<hash>.json` (`$XDG_CACHE_HOME` if set; the hash covers the model
@@ -642,6 +680,19 @@ model permutes the experts hottest first from that profile, so the GPU slice sta
 experts instead of the checkpoint's arbitrary head. A profile from a different workload only costs
 what the default placement costs anyway, and the map adapts from there. `EXL3_MOE_CPU_SPLIT_STATS`
 (an explicit stats file in the same per-layer format) takes precedence.
+
+### `EXL3_MOE_CPU_PROMOTE_BUDGET` (default: `6`; `3` on Windows and WSL2)
+
+Promotions promote-on-miss may issue per decode step over all layers, at most one per layer (and
+as many demotions). A step routes far more experts to the worker than the budget can move, so the
+budget bounds how fast the resident set follows a change of topic or the start of a session, and it
+is normally spent on every step. Each transfer also costs host time and copies on a side stream, so
+the best value depends on the machine: where worker experts are expensive (fewer cores, no AVX-512)
+a larger budget (e.g. `12` to `24`) raises the hit rate and decode speed, most visibly with MTP
+drafting, while a CPU fast enough to hide its experts behind the GPU's own work gains nothing from
+the extra transfers and can come out slightly slower. The default is lower where the GPU is driven through
+WDDM (Windows, and WSL2, detected by `/dev/dxg`): streams run in submission order there, so every
+transfer delays the next draft forward. `0` issues no transfers.
 
 ### `EXL3_MOE_CPU_PROMOTE_VERIFY` (default: unset)
 
@@ -816,7 +867,7 @@ Enable GPU/CPU handoff profiling, for debug purposes.
 
 ### `EXL3_EXPANDABLE_SEGMENTS` (default: `1`)
 
-Use expandable segments for all Torch allocations. Opt out with a value of 1 or by explicitly
+Use expandable segments for all Torch allocations. Opt out with a value of 0 or by explicitly
 setting `PYTORCH_CUDA_ALLOC_CONF`.
 
 ### `EXL3_LOAD_ARENA` (default: `1`)

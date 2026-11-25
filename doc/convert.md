@@ -21,13 +21,17 @@ does.
 
 - **-vb / --vision_bits *int***: Number of bits per weight for the vision component, for models that have one. Must be an integer from 1 to 8, or 16 to copy the vision model unquantized. The default depends on the architecture: vision towers validated for low-bitrate quantization default to 6, everything else to 16. Vision layers are quantized without calibration.
 
-- **-ngb / --ngram_bits *int***: Bits per weight for hashed n-gram embedding tables (PLE models, e.g. Qwen3.8-Flash-Next). Must be an integer from 1 to 8, default is `--bits` rounded to the nearest integer. The table is quantized (without calibration) before the layer-by-layer conversion and written as a standalone `ngram_embedding.safetensors` in the output directory; calibration forwards then run against the quantized table. Table quantization is resumable together with the rest of the job.
+- **-ngb / --ngram_bits *int***: Bits per weight for hashed n-gram embedding tables (PLE models, e.g. Qwen3.8-Flash-Next, and the Engram tables of Hy4 flash). Must be an integer from 1 to 8, default is `--bits` rounded to the nearest integer. The tables are quantized (without calibration) before the layer-by-layer conversion and written to a standalone `ngram_embedding.safetensors` in the output directory, one after the other when the model has several; calibration forwards then run against the quantized tables. Table quantization is resumable together with the rest of the job.
 
 - **-eb / --embed_bits *int***: Bits per weight for the token embedding table. Must be an integer from 1 to 8, or 16 (the default) to store the table unquantized. Each embedding is split into 256-wide groups that are rotated and trellis-coded without calibration, and the following layers are calibrated against the quantized table. A quantized table is decoded on the GPU at inference, and can be held in system RAM or streamed from disk (`--embed_disk` in `model_init`-based scripts). The table of an existing EXL3 model can be quantized with `util/recompile.py --embed_bits`.
 
 - **-ngf / --ngram_file *file***: Pre-quantized n-gram table (from `util/convert_ngram.py`) to copy into the output model instead of quantizing the table as part of the job. Overrides `--ngram_bits`.
 
 - **-hq / --hq [N]**: Increase the bitrate of select layers, such as attention and shared-expert layers. Final model bitrate may be somewhat higher than requested by `--bits`, but for MoE models this is typically a very small increase in size (0.05 - 0.10 bpw) for a disproportionately large increase in model fidelity. Each promoted layer's floor rises by the architecture's `select_hq_bits` for that layer; `-hq 2` doubles the promotion (`-hq N` multiplies it by N). 
+
+- **-mae / --moe_affinity_eps *eps***: Quantize each block-sparse (MoE) expert against its own Hessian instead of the layer's shared one. Calibration tokens are weighted by `eps` plus the expert's routing weight relative to its mean over the calibration set (zero for tokens the router does not send to it), so an expert is calibrated on the inputs it actually sees while `eps` keeps the whole input distribution in play. Applies to models calibrated with every expert active. Typical value 0.01.
+
+- **-mar / --moe_affinity_rows *N***: With `--moe_affinity_eps`, the number of calibration tokens sampled per layer for the per-expert gate/up Hessians (the down Hessians use every token). Default 262144.
 
 - **-rcp / --recipe *file***: Per-tensor bitrate recipe (YAML, e.g. from `sc_optimize.py`), used in place of the budgeted allocation from `--bits`/`--head_bits`. Keys under `tensors` are exact tensor keys or wildcard patterns (`*`, `?`, `[...]`), resolved top to bottom so a later entry overrides an earlier one for the tensors it matches. Every quantized tensor of the model must be covered, and every entry must match at least one tensor; both are checked before calibration starts. The head and MTP layers take `--head_bits`/`--mtp_bits` (or the recipe's `head_bits`), and `--hq` still promotes the select layers of the MTP head. Without a `target_bpw` in the recipe, pass `--bits` (used for reporting only). Keys starting with `*` must be quoted in YAML:
   ```yaml
@@ -50,6 +54,8 @@ does.
 - **-h1 / --hessians_one_sided**: Keep the regular one-sided LDLQ for tensors that have `hout`, so that `--hessians` only serves `--out_scales yaqa`.
 
 - **-hreg / --hessians_reg *float***: Diagonal regularization of the output-side Hessian in two-sided LDLQ, relative to its mean diagonal. Larger values blend toward one-sided LDLQ. Default is 0.025.
+
+- **--no-scaled_hessian**: Share one Hessian factorization per input instead of factoring it per tensor with the tensor's input channel scales folded in. Per-tensor factorization is the default, so that LDLQ's error feedback weights each row by what its error costs at the output, and it takes more transient memory on MoE models. `-sh / --scaled_hessian` are accepted and do nothing.
 
 - **-cb / --codebook *str***: Trellis codebook: "mul1" (default), "mcg" or "3inst". The mul1 codebook is required by some optimized inference paths (int8 GEMV, CPU expert offload); there is no reason to pick another codebook except for testing.
 

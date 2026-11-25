@@ -60,12 +60,13 @@ def add_args(
     """
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
+    parser.add_argument("-ad", "--attn_device", type = int, default = None, help = "Split load: device for the attention layers of models that share K/V pools across layers (DeepSeek-V4.1), default: first device of the split")
     parser.add_argument("-lm", "--load_metrics", action = "store_true", help = "Show metrics from loader")
     parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
 
     parser.add_argument("-tp", "--tensor_parallel", action = "store_true", help = "Load model in Tensor-parallel mode, attempts to respect --gpu_split")
     parser.add_argument("-mcl", "--moe_cpu_offload", type = int, help = "Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU, with expert weights in system RAM. Layer-split mode only; requires mul1-codebook experts (ineligible layers fall back to the GPU)", default = 0)
-    parser.add_argument("-mcs", "--moe_cpu_split", type = int, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Mutually exclusive with --moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts", default = 0)
+    parser.add_argument("-mcs", "--moe_cpu_split", type = int, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Mutually exclusive with --moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts. Main model only: a draft model or MTP head stays on the GPU unless --draft_moe_cpu_split is given", default = 0)
     parser.add_argument("-mcpa", "--moe_cpu_pinned_arena", action = "store_true", help = "Experimental: back the CPU MoE worker's expert arena with shared, page-locked memory, so streamed prefill DMAs experts straight out of it and --moe_cpu_split promotes experts into spare GPU slots on the fly (promote-on-miss placement). Costs ~0.2 s per GiB at load and counts the arena in both processes' RSS")
     parser.add_argument("-mct", "--moe_cpu_threads", type = int, help = "Worker thread count for --moe_cpu_offload / --moe_cpu_split (default: EXL3_MOE_CPU_THREADS env, else physical cores minus EXL3_MOE_HOST_CORES)", default = None)
     parser.add_argument("-ngl", "--ngram_lock", action = "store_true", help = "As --ngram_ram, and lock the table's pages in RAM (mlock) so they are never swapped out or reclaimed; needs RLIMIT_MEMLOCK (ulimit -l) to cover the table, or CAP_IPC_LOCK")
@@ -133,8 +134,10 @@ def add_args(
         parser.add_argument("-hdt", "--hybrid_draft_tokens", type = int, help = "Hybrid drafting: when a job's current suffix matches at least this many tokens of its earlier context, draft that many tokens of the continuation (on top of any other drafting mode)", default = 0)
         parser.add_argument("-ngram_corpus", "--ngram_corpus", type = str, help = "Frozen SAM corpus file for n-gram drafting (requires --ngram_match_min > 0)", default = None)
         parser.add_argument("-dds", "--dynamic_draft", action = "store_true", help = "Dynamically adapt draft length to acceptance rate (num_draft_tokens acts as ceiling)")
+        parser.add_argument("-sdh", "--sparse_draft_head", type = int, default = 0, help = "Draft through a dynamic sparse LM head of this many vocabulary columns (MTP/DFlash drafting; 0 = full head)")
         parser.add_argument("-dc", "--draft_confidence", type = float, help = "Confidence target for dynamic draft truncation, default: 0.4", default = 0.4)
         parser.add_argument("-dmcl", "--draft_moe_cpu_layers", type = int, help = "Experimental: like --moe_cpu_offload, but for the draft model (or MTP head)", default = 0)
+        parser.add_argument("-dmcs", "--draft_moe_cpu_split", type = int, help = "Experimental: like --moe_cpu_split, but for the draft model (or MTP head), counted against its own number of routed experts per layer. Mutually exclusive with --draft_moe_cpu_layers", default = 0)
 
 
 def get_arg_sampler(args):
@@ -237,20 +240,27 @@ def init(
         config.infer_params.embed_stream_from_disk = True
     if override_dynamic_seq_len: config.override_dynamic_seq_len(override_dynamic_seq_len)
     dmcl = getattr(args, "draft_moe_cpu_layers", 0)
+    dmcs = getattr(args, "draft_moe_cpu_split", 0)
     dmclt = getattr(args, "moe_cpu_threads", None)
     if dmcl:
         assert not args.tensor_parallel, "--draft_moe_cpu_layers currently requires layer-split mode"
         assert draft_model_dir, "--draft_moe_cpu_layers requires a draft model (or --mtp)"
+    if dmcs:
+        assert not args.tensor_parallel, "--draft_moe_cpu_split currently requires layer-split mode"
+        assert draft_model_dir, "--draft_moe_cpu_split requires a draft model (or --mtp)"
+        assert not dmcl, "--draft_moe_cpu_split and --draft_moe_cpu_layers are mutually exclusive"
     if use_mtp:
         draft_config = config
-        # Shared config: the MTP head is a separate component with its own budget and worker
+        # Shared config: the MTP head is a separate component with its own budgets and worker
         config.infer_params.draft_moe_cpu_offload = dmcl
+        config.infer_params.draft_moe_cpu_split = dmcs
         if dmclt is not None:
             config.infer_params.draft_moe_cpu_threads = dmclt
     elif draft_model_dir:
         draft_config = Config.from_directory(draft_model_dir)
-        # Separate config: the draft model's own text component takes the budget
+        # Separate config: the draft model's own text component takes the budgets
         draft_config.infer_params.moe_cpu_offload = dmcl
+        draft_config.infer_params.moe_cpu_split = dmcs
         if dmclt is not None:
             draft_config.infer_params.moe_cpu_threads = dmclt
         draft_config.infer_params.moe_cpu_pinned_arena = config.infer_params.moe_cpu_pinned_arena
@@ -373,8 +383,10 @@ def init(
     if len(tp_dev_limits) and not args.tensor_parallel:
         printp(not quiet, " !! Warning, parallelism are do not applied to layer-split model")
 
-    # Load draft model
-    if draft_model_dir:
+    # Load draft model (one that reads the target's cache in place loads with the target below)
+    if draft_model_dir and draft_model.caps.get("load_with_target"):
+        printp(not quiet, f" -- Loading {draft_model_dir} with the target model")
+    elif draft_model_dir:
         printp(not quiet, f" -- Loading {draft_model_dir}")
         draft_model.load(
             use_per_device = split,
@@ -390,6 +402,7 @@ def init(
     printp(not quiet, f" -- Loading {args.model_dir}")
     model.load(
         use_per_device = split,
+        attn_device = args.attn_device,
         tensor_p = args.tensor_parallel,
         progressbar = progress,
         tp_dev_limits = tp_dev_limits,
@@ -399,6 +412,7 @@ def init(
         max_batch_size = args.autosplit_max_batch_size,
         autosplit_no_forward = args.autosplit_no_forward,
         max_chunk_size = args.chunk_size,
+        draft_model = draft_model,
         **kwargs
     )
 

@@ -32,8 +32,9 @@ Engines: "exllamav3" (module-streamed), "transformers" (full load with accelerat
 "llamacpp" (llama-cpp-python, full logits), "vllm" (offline vllm.LLM, teacher-forced over the
 whole test set via a full-vocab prompt-logprobs capture -- see qbench/engines.py's module
 docstring above VllmBackend for how). A model entry may carry an "options" dict passed to the
-engine (e.g. device_map or trust_remote_code for transformers, n_gpu_layers for llamacpp,
-gpu_memory_utilization/tensor_parallel_size/quantization for vllm).
+engine (e.g. device_map, trust_remote_code or time_step_limit for transformers, n_gpu_layers
+for llamacpp, gpu_memory_utilization/tensor_parallel_size/quantization for vllm; see the
+engine docstrings).
 
 Relative paths in the project file resolve against the project file's directory.
 """

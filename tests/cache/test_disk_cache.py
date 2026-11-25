@@ -13,6 +13,7 @@ slot size and something to copy. The fingerprint is overridden so no model is ne
 import errno
 import os
 import shutil
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -226,6 +227,46 @@ def test_index_is_rebuilt_from_files(device, tmp_path):
     assert len(disk2) == 2 and disk2.has_page(phash(1)) and disk2.has_page(phash(2))
     disk2.close()
     tier2.close()
+
+
+def test_pages_and_checkpoints_of_another_process_are_adopted_without_a_reopen(device, tmp_path):
+    # Two tiers open on one directory, as two processes sharing a root. What the first writes after the second
+    # opened is found by the hashes of a coming allocation: the pages, their chain metadata and the checkpoint
+    # they anchor; a hash not asked for stays unknown, and the adopted pages restore like any other
+    tier_a, disk_a, tensor_a = build(8, device, tmp_path)
+    tier_b, disk_b, tensor_b = build(8, device, tmp_path)
+    for tag in range(1, 4):
+        fill(tensor_a, tag, float(tag))
+        tier_a.store(page(tag, tag, prev = phash(tag - 1) if tag > 1 else None), serial = tag)
+    stashed = {"position": 96, "checkpoint_size": 4096, "layer.a": torch.full((8,), 2.0)}
+    disk_a.write_state(phash(3), stashed)
+    disk_a.flush()
+    assert not disk_b.has_page(phash(1)) and not disk_b.has_state(phash(3))
+
+    disk_b.prefetch([phash(1), phash(2)], serial = 1)
+    assert disk_b.has_page(phash(1)) and disk_b.has_page(phash(2)) and not disk_b.has_page(phash(3))
+    assert disk_b.page_prev_hash(phash(2)) == phash(1) and disk_b.chain_prev(phash(2)) == phash(1)
+    assert disk_b.metrics["pages_adopted"] == 2 and disk_b.metrics["states_adopted"] == 0
+    assert disk_b.total_size == disk_a.pages[phash(1)]["size"] + disk_a.pages[phash(2)]["size"]
+    for tag in (1, 2):
+        if phash(tag) not in tier_b:
+            assert tier_b.promote(phash(tag), serial = 20) is not None
+        e = tier_b.fetch(phash(tag), 0, serial = 20)
+        assert e is not None and e["pending"].is_set()
+        torch.cuda.synchronize()
+        assert torch.all(tensor_b[0] == float(tag))
+
+    disk_b.prefetch([phash(3)], serial = 2)
+    assert disk_b.has_page(phash(3)) and disk_b.has_state(phash(3))
+    assert disk_b.metrics["states_adopted"] == 1
+    back = disk_b.read_state(phash(3))
+    assert back["position"] == 96 and torch.equal(back["layer.a"], stashed["layer.a"])
+    host_pool.give(back)
+    # Asking again finds nothing new
+    assert disk_b.adopt([phash(1), phash(2), phash(3)]) == 0
+    for disk, tier in ((disk_a, tier_a), (disk_b, tier_b)):
+        disk.close()
+        tier.close()
 
 
 def test_root_budget_evicts_least_recently_used_sibling_directories(device, tmp_path):
@@ -610,5 +651,241 @@ def test_prune_keeps_the_last_checkpoint_of_each_chain(device, tmp_path):
     assert disk.write_state(phash(41), state(10496), force = True)
     disk.flush()
     assert disk.has_state(phash(41))
+    disk.close()
+    tier.close()
+
+
+def test_make_room_terminates_when_only_anchored_checkpoints_remain(device, tmp_path):
+    # A checkpoint whose page is in the CPU tier but not on disk is not in any chain the order walks; with no
+    # budget left it must still be evictable, and _make_room must return instead of spinning
+    tier, disk, tensor = build(4, device, tmp_path)
+    tier.store(page(1, 1), serial = 1)
+    disk.flush()
+    stashed = {"position": 256, "checkpoint_size": 64, "x": torch.ones(16)}
+    assert disk.write_state(phash(1), stashed)
+    disk.flush()
+    with disk._lock:
+        disk._drop("page", phash(1))          # page leaves the disk, stays in the CPU tier: the state is anchored there
+    disk.flush()
+    assert disk.has_state(phash(1)) and not disk.has_page(phash(1))
+    disk.max_size = 0
+    with disk._lock:
+        fits = disk._make_room(1)
+    assert not fits
+    disk.flush()
+    assert disk.total_size == 0 and not disk.has_state(phash(1))
+    disk.close()
+    tier.close()
+
+
+def test_root_budget_reclaims_least_recently_used_pages_of_a_live_sibling(device, tmp_path):
+    # Directory A is in use (its tier is open) and holds a chain of four. B opens with a root budget that
+    # leaves it no share; its writes make room by taking A's least recently used leaf pages, tail first, and
+    # A's owner finds the taken page gone on its next read
+    tier_a, disk_a, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "aaaa")
+    prev = None
+    for tag in range(1, 5):
+        tier_a.store(page(tag, tag, prev), serial = tag)
+        prev = phash(tag)
+    disk_a.flush()
+    page_bytes = disk_a.image_size + 512
+    # Root: what A holds plus half a page, so B's share cannot take a page until something of A's goes. Processes
+    # on one root must agree on the budget: A's declaration is set to the root B will use, as if A had been
+    # started with it (a reopen would change A's directory size through the WAL checkpoint)
+    root = DiskPageCache._dir_size(disk_a.dir) + page_bytes // 2
+    disk_a._retract_budget()
+    disk_a.root_size = disk_a.max_size = root
+    disk_a._declare_budget()
+    tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = root, fingerprint = "bbbb")
+    assert os.path.isdir(disk_a.dir) and 0 <= disk_b.max_size < page_bytes
+    # Over B's share but within the reclaim chunk: written, with the reclaim queued behind it
+    tier_b.store(page(11, 11 % NUM_PAGES), serial = 11)
+    disk_b.flush()                                                  # the reclaim has run
+    assert disk_b.metrics.get("skipped_budget", 0) == 0 and disk_b.has_page(phash(11))
+    assert disk_b.metrics.get("pages_reclaimed", 0) >= 1
+    assert disk_b.max_size >= disk_b.total_size + page_bytes        # back within the root, with room for more
+    tier_b.store(page(12, 12 % NUM_PAGES), serial = 12)
+    disk_b.flush()
+    assert disk_b.has_page(phash(12))
+    # A lost its tail, never its root; the files and the index rows went together
+    assert not os.path.exists(disk_a._page_path(phash(4)))
+    assert os.path.exists(disk_a._page_path(phash(1)))
+    assert disk_a.has_page(phash(4))                                # A's mirror has not noticed yet
+    assert disk_a.read_page_into(phash(4), None) is None            # ... and drops it when the read misses
+    assert not disk_a.has_page(phash(4))
+    disk_b.close(); tier_b.close()
+    disk_a.close(); tier_a.close()
+    # Reopened, A's index agrees with its files
+    tier_a2, disk_a2, _ = build(8, device, tmp_path, disk_size = root, fingerprint = "aaaa")
+    assert not disk_a2.has_page(phash(4)) and disk_a2.has_page(phash(1))
+    disk_a2.close(); tier_a2.close()
+
+
+def _chain(tier, tags, prev = None):
+    for tag in tags:
+        tier.store(page(tag, tag % NUM_PAGES, prev), serial = tag)
+        prev = phash(tag)
+    return prev
+
+
+def test_new_directory_takes_the_siblings_older_space_before_its_own(device, tmp_path):
+    # A holds a chain of four from earlier. B opens with a share of about two pages and writes four: the
+    # least recently used entries of the root are A's, so B keeps all of its pages and A gives up its tail,
+    # instead of B evicting its own newer pages to stay within the share it was given at open
+    tier_a, disk_a, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "aaaa")
+    _chain(tier_a, range(1, 5))
+    disk_a.flush()
+    disk_a.close(); tier_a.close()
+    time.sleep(0.01)
+    page_bytes = disk_a.image_size + 512
+    root = DiskPageCache._dir_size(disk_a.dir) + 2 * page_bytes
+    tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = root, fingerprint = "bbbb")
+    assert disk_b._sibling_oldest is not None
+    prev = None
+    for tag in range(11, 15):
+        prev = _chain(tier_b, [tag], prev)
+        disk_b.flush()
+    assert all(disk_b.has_page(phash(t)) for t in range(11, 15))
+    assert disk_b.metrics["evictions"] == 0 and disk_b.metrics.get("pages_reclaimed", 0) >= 2
+    assert not os.path.exists(disk_a._page_path(phash(4))) and os.path.exists(disk_a._page_path(phash(1)))
+    # Back within the root once the reclaims have run
+    assert disk_b.total_size <= disk_b.max_size
+    disk_b.close(); tier_b.close()
+
+
+def test_directory_evicts_its_own_entries_when_the_siblings_hold_newer_ones(device, tmp_path):
+    # B's pages are from an earlier session; A wrote its pages since. B is over its share, and its own least
+    # recently used page is older than anything of A's, so B evicts that one and leaves A alone
+    tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "bbbb")
+    _chain(tier_b, range(11, 13))
+    disk_b.flush()
+    disk_b.close(); tier_b.close()
+    time.sleep(0.01)
+    tier_a, disk_a, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "aaaa")
+    _chain(tier_a, range(1, 3))
+    disk_a.flush()
+    tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "bbbb")
+    assert len(disk_b) == 2 and disk_b._sibling_oldest is not None
+    # Shrink the root so that B's share leaves room for half a page beyond what it holds (the index files
+    # make a budget from directory sizes imprecise)
+    others = disk_b.root_size - disk_b.max_size
+    disk_b.max_size = disk_b.total_size + disk_b.page_file_size // 2
+    disk_b.root_size = others + disk_b.max_size
+    tier_b.store(page(13, 13 % NUM_PAGES), serial = 13)
+    disk_b.flush()
+    assert disk_b.has_page(phash(13)) and disk_b.metrics["evictions"] >= 1
+    assert disk_b.metrics.get("pages_reclaimed", 0) == 0
+    assert disk_a.has_page(phash(1)) and disk_a.has_page(phash(2))
+    assert os.path.exists(disk_a._page_path(phash(2)))
+    disk_b.close(); tier_b.close()
+    disk_a.close(); tier_a.close()
+
+
+def test_idle_flush_ends_when_vram_holds_more_pages_than_the_disk_budget(device, tmp_path):
+    # Twelve complete pages in VRAM, a CPU tier of four slots and a disk budget of three pages. Each flush
+    # step used to list the VRAM pages again, find the ones the disk tier had just evicted, and write them
+    # again: the idle flush never ended and rewrote the same pages for as long as the server sat idle. One
+    # pass over a list taken at its start ends, and writes no more than the budget holds
+    from exllamav3.constants import PAGE_SIZE as KV_PAGE_SIZE
+    from exllamav3.generator.generator import Generator
+
+    tier, disk, _ = build(4, device, tmp_path, disk_size = 1 << 40)
+    root = 3 * disk.page_file_size + 4096
+    disk.close(); tier.close()
+    tier, disk, _ = build(4, device, tmp_path, disk_size = root)
+
+    def vram_page(tag):
+        p = page(tag, tag % NUM_PAGES)
+        return SimpleNamespace(phash = p.phash, prev_hash = None, page_index = p.page_index, sequence = p.sequence,
+                               persistable = True, kv_position = KV_PAGE_SIZE, access_serial = tag)
+
+    pages = {phash(t): vram_page(t) for t in range(1, 13)}
+    gen = Generator.__new__(Generator)
+    gen.disk_page_cache, gen.cpu_page_cache, gen.recurrent_cache = disk, tier, None
+    gen.pagetable = SimpleNamespace(unreferenced_pages = pages, referenced_pages = {}, access_serial = 100)
+    gen.pending_jobs, gen.active_jobs = [], []
+    gen._flush_pass = None
+
+    gen.flush_cache_to_disk(max_pages = 1)
+    steps = 0
+    while gen.has_idle_work() and steps < 100:
+        gen.idle_work()
+        disk.flush()
+        steps += 1
+    assert not gen.has_idle_work(), "the idle flush did not end"
+    assert disk.metrics["page_writes"] <= 3
+    # The pages the pass kept are the most recently used ones
+    assert all(disk.has_page(phash(t)) or phash(t) in tier for t in (10, 11, 12))
+    disk.close(); tier.close()
+
+
+def test_processes_sharing_a_root_must_agree_on_the_budget(device, tmp_path):
+    # Each directory records the budget of the process using it. A second tier on the root with a different budget
+    # is refused while the first is open (same directory or a sibling), accepted with the same budget; a closed
+    # tier retracts its declaration, and a declaration of a process that no longer runs does not count
+    import json
+    tier_a, disk_a, _ = build(8, device, tmp_path, disk_size = 1 << 30, fingerprint = "model_a")
+    with pytest.raises(ValueError, match = "same disk cache size"):
+        build(8, device, tmp_path, disk_size = 1 << 29, fingerprint = "model_a")
+    with pytest.raises(ValueError, match = "same disk cache size"):
+        build(8, device, tmp_path, disk_size = 1 << 29, fingerprint = "model_b")
+    tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = 1 << 30, fingerprint = "model_b")
+    disk_b.close(); tier_b.close()
+    assert not os.path.exists(os.path.join(tmp_path, "model_b", "budget.json"))
+    disk_a.close(); tier_a.close()
+    tier_c, disk_c, _ = build(8, device, tmp_path, disk_size = 1 << 29, fingerprint = "model_c")
+    disk_c.close(); tier_c.close()
+    # A declaration left by a process that died (a pid nothing runs under, fresh file) is ignored
+    with open(os.path.join(tmp_path, "model_a", "budget.json"), "w") as f:
+        json.dump({"root_size": 1 << 20, "pid": 2 ** 22 - 1, "time": time.time()}, f)
+    tier_d, disk_d, _ = build(8, device, tmp_path, disk_size = 1 << 29, fingerprint = "model_d")
+    disk_d.close(); tier_d.close()
+
+
+def test_adopt_does_not_take_back_an_entry_whose_delete_is_queued(device, tmp_path):
+    # An eviction drops a page from the mirror and queues the delete of its file and index row. A prefetch that
+    # asks for the page before the writer gets there must not adopt the row back, and a write of the same page
+    # queued meanwhile (it came back through the CPU tier) must leave one entry counted once. Before the fix,
+    # each such round added a page's size to total_size for good, until the tier thought itself full while
+    # holding almost nothing
+    import sqlite3
+    tier, disk, tensor = build(8, device, tmp_path)
+    prev = None
+    for tag in range(1, 4):
+        fill(tensor, tag, float(tag))
+        tier.store(page(tag, tag, prev), serial = tag)
+        prev = phash(tag)
+    disk.flush()
+
+    def index_size():
+        conn = sqlite3.connect(os.path.join(disk.dir, "index.sqlite"))
+        try:
+            return conn.execute("SELECT COALESCE(SUM(size), 0) FROM pages").fetchone()[0]
+        finally:
+            conn.close()
+
+    size = index_size()
+    assert disk.total_size == size
+    h = phash(3)
+    e = tier.entries[h]
+    for _ in range(3):
+        with disk._lock:                        # holds the writer thread before its next operation
+            disk._drop("page", h)
+            assert disk.write_page(h, phash(2), e["tokens"], e["slot"], [])
+            assert disk.adopt([h]) == 0
+        disk.flush()
+        assert disk.total_size == index_size() == size
+        assert disk.has_page(h) and os.path.exists(disk._page_path(h))
+    assert not disk.pending_deletes
+
+    # A dropped checkpoint is not adopted back either
+    stashed = {"position": 96, "checkpoint_size": 4096, "layer.a": torch.full((8,), 1.0)}
+    assert disk.write_state(h, stashed)
+    disk.flush()
+    with disk._lock:
+        disk._drop("state", h)
+        assert disk.adopt([h]) == 0
+    disk.flush()
+    assert not disk.has_state(h) and disk.total_size == index_size() == size
     disk.close()
     tier.close()

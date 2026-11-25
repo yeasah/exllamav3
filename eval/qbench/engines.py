@@ -56,8 +56,23 @@ def noise_seed(row: int, layer: int) -> int:
     return 1 + 1_000_003 * row + layer + 1_000_000_007 * NOISE_SALT
 
 
-def apply_mult_noise(x: torch.Tensor, eps: float, gen: torch.Generator) -> torch.Tensor:
-    n = torch.randn(x.shape, generator = gen, device = x.device, dtype = torch.float)
+def row_views(ids: torch.Tensor, lengths: list[int] | None) -> list[torch.Tensor]:
+    """Per-row (1, len) views of right-padded ids, cut to each row's own length when given
+    (positions past the last scored one are causally inert, so this only saves compute)"""
+    if lengths is None:
+        return list(ids.split(1))
+    return [ids[r:r + 1, :n] for r, n in enumerate(lengths)]
+
+
+def apply_mult_noise(x: torch.Tensor, eps: float, gens: dict, seed: int | None = None) -> torch.Tensor:
+    """Generators can't cross devices and activations do (an unquantized embedding runs on the CPU), so gens
+    holds one per device. With seed, the device's generator is reseeded first (noise_seed: per row and layer)"""
+    if x.device not in gens:
+        gens[x.device] = torch.Generator(device = x.device)
+        gens[x.device].manual_seed(1)
+    if seed is not None:
+        gens[x.device].manual_seed(seed)
+    n = torch.randn(x.shape, generator = gens[x.device], device = x.device, dtype = torch.float)
     return (x.float() * (1.0 + eps * n)).to(x.dtype)
 
 
@@ -321,7 +336,7 @@ class Exl3Backend:
         # the groups to avoid it); decided once, from the real size after the first module
         state_budget = self._state_budget()
         offload_states = None
-        gen = torch.Generator(device = self.device)
+        gens = {}
 
         sum_bits = sum_numel = head_bits = head_numel = embed_bits = embed_numel = 0
         with ProgressBar("Streaming", len(modules)) as pb:
@@ -432,8 +447,7 @@ class Exl3Backend:
                         x = x.clone()
                     if noise_eps and idx < len(modules) - 2 and x.is_floating_point():
                         # Keyed to (row, module), so grouping and row order leave it unchanged
-                        gen.manual_seed(noise_seed(row_index[r], idx))
-                        x = apply_mult_noise(x, noise_eps, gen)
+                        x = apply_mult_noise(x, noise_eps, gens, noise_seed(row_index[r], idx))
                     if logits_layer:
                         callback(r, x, offset)
                         states[r] = None
@@ -524,6 +538,13 @@ class TransformersBackend:
     Noise (for the self-noise floor) is injected with forward hooks on the decoder layer list,
     located as the largest ModuleList of same-type children; these compose with the streaming
     hooks unchanged.
+
+    {time_step_limit: config} or {time_step_limit: [min, max]} overrides the runtime dt clamp of
+    every Mamba2-style mixer (modules with a time_step_limit attribute). transformers' native
+    NemotronH mixer takes its floor from time_step_min, the dt initialization range, where the
+    checkpoint's time_step_limit says [0, inf] (as HF Mamba2 and exllamav3 read it); the floor
+    makes the state drift along the sequence and every quant then appears to disagree with the
+    reference past a few hundred tokens.
     """
 
     def __init__(self, source: str, max_len: int, device: torch.device, options: dict):
@@ -558,14 +579,19 @@ class TransformersBackend:
                 "model resident, which is what makes it work on a model larger than the "
                 "GPU. Remove `streaming: true`."
             )
-        # w4a4_sim: emulate NVFP4 activation quantization (ModelOpt W4A4 recipe) on the
-        # quantized expert GEMMs: static per-expert input_scale (calibrated global) + dynamic
-        # per-16-group e4m3 scales + e2m1 values, computed in fp32 and applied as fake-quant
-        # before the bf16 GEMMs. Weight-side fidelity of the same quantizer: 99.88% of stored
-        # e2m1 codes reproduced bit-exact from the bf16 originals
+        # w4a4_sim: emulate the checkpoint's static activation quantization where it declares
+        # input scales. NVFP4 expert GEMMs (ModelOpt W4A4 recipe): static per-expert input_scale
+        # (calibrated global) + dynamic per-16-group e4m3 scales + e2m1 values, computed in fp32
+        # and applied as fake-quant before the bf16 GEMMs. FP8 projections of a mixed export:
+        # per-tensor static e4m3 fake-quant of the Linear input. Weight-side fidelity of the same
+        # quantizer: 99.88% of stored e2m1 codes reproduced bit-exact from the bf16 originals
         self.w4a4_sim = options.get("w4a4_sim", False)
+        if self.w4a4_sim and not self.streaming:
+            raise ValueError("w4a4_sim is implemented on the streaming path (streaming: true)")
         self.shard_shims = []
         self.a4_wraps = []
+        self.a4_hooks = []
+        self.a4_count = [0, 0]     # expert modules, fp8 linears wrapped so far
         self.shard_handles = {}
 
         if self.streaming or self.quantize_spec:
@@ -583,13 +609,14 @@ class TransformersBackend:
             # built unquantized (plain Linear modules), so the quantization config must not
             # reach from_config. Supported: compressed-tensors pack-quantized (AWQ-style int
             # groups), compressed-tensors mixed-precision / nvfp4-pack-quantized /
-            # float-quantized (llm-compressor FP8-channel + NVFP4 mixes), and ModelOpt mixed
-            # FP8 / NVFP4. Evaluation is weight-only in all cases: the deployed stacks'
-            # activation quant (static or dynamic fp8/fp4) and fp8 kv cache are not emulated,
-            # so results are the checkpoint's weight fidelity under bf16 compute
+            # float-quantized (llm-compressor FP8-channel + NVFP4 mixes), ModelOpt mixed
+            # FP8 / NVFP4, and MLX affine packs. Evaluation is weight-only in all cases: the
+            # deployed stacks' activation quant (static or dynamic fp8/fp4) and fp8 kv cache are
+            # not emulated, so results are the checkpoint's weight fidelity under bf16 compute
             self.ct_bits = None
             self.dequant_scaled = False
             self.scale_block = ()
+            self.mlx = None
             self.quant_desc = "none (checkpoint dtype)"
             qcfg = getattr(config, "quantization_config", None)
             if qcfg is not None:
@@ -610,8 +637,18 @@ class TransformersBackend:
                         if isinstance(w, dict) and w.get("type", "int") == "int":
                             self.ct_bits = w.get("num_bits", 4)
                     self.dequant_scaled = True
-                elif qm == "modelopt":
+                elif qm in ("modelopt", "modelopt_mixed"):
+                    # ModelOpt HF export, uniform (NVFP4 or FP8) or MIXED_PRECISION (per-layer
+                    # quant_algo: FP8 projections + NVFP4 experts, bf16 for the ignore list).
+                    # The scheme of every tensor follows from its sidecars either way:
+                    # weight_scale_2 -> NVFP4, fp8 weight + scalar weight_scale -> FP8
                     self.dequant_scaled = True
+                    if qm == "modelopt_mixed":
+                        import collections
+                        algos = collections.Counter(
+                            (v.get("quant_algo") if isinstance(v, dict) else getattr(v, "quant_algo", "?"))
+                            for v in (q_get("quantized_layers", {}) or {}).values())
+                        self.quant_desc = "modelopt mixed: " + ", ".join(f"{a} x{n}" for a, n in algos.most_common())
                 elif qm == "fp8":
                     # AutoFP8/DeepSeek-style: fp8-e4m3 weights with blockwise (typically
                     # 128x128) weight_scale_inv, unquantized modules stay plain bf16
@@ -631,6 +668,17 @@ class TransformersBackend:
                     # gpt-oss-style: MoE expert tensors stored as <name>_blocks (packed fp4
                     # e2m1 pairs) + <name>_scales (e8m0); resolved per-tensor by sidecar
                     pass
+                elif qm is None and q_get("bits") is not None and q_get("group_size") is not None:
+                    # MLX pack (mlx-lm / mlx-vlm conversion): no quant_method, the defaults as
+                    # top-level keys and, for mixed packs, one {bits, group_size} entry per
+                    # module path. Quantized Linear and Embedding modules store <stem>.weight
+                    # (packed uint32), <stem>.scales and <stem>.biases
+                    self.mlx = dict(qcfg) if isinstance(qcfg, dict) else qcfg.to_dict()
+                    modes = {self.mlx.get("mode", "affine")} | \
+                        {v.get("mode", "affine") for v in self.mlx.values() if isinstance(v, dict)}
+                    if modes != {"affine"}:
+                        raise ValueError(f"Streaming does not support MLX quantization modes {sorted(modes)}")
+                    self.quant_desc = f"mlx affine, {q_get('bits')} bits, group size {q_get('group_size')}"
                 else:
                     raise ValueError(f"Streaming does not support this quantization_config: {qm}")
                 delattr(config, "quantization_config")
@@ -707,11 +755,15 @@ class TransformersBackend:
             # ConditionalGeneration wrappers whose CausalLM class is the inner text model, under
             # text_config.model_type (e.g. qwen3_5's model.language_model.* strip lives under
             # qwen3_5_text only)
+            # Composite wrappers name the nested config freely (text_config, llm_config for
+            # NemotronH Omni, ...), so take the model_type of every nested config object
+            from transformers import PretrainedConfig
             model_types = [config.model_type]
-            if getattr(config, "text_config", None) is not None:
-                tmt = getattr(config.text_config, "model_type", None)
-                if tmt and tmt not in model_types:
-                    model_types.append(tmt)
+            for sub in vars(config).values():
+                if isinstance(sub, PretrainedConfig):
+                    tmt = getattr(sub, "model_type", None)
+                    if tmt and tmt not in model_types:
+                        model_types.append(tmt)
 
             renames = []          # (source substring, target substring)
             self.converters = []  # (target pattern, [source patterns], [ops])
@@ -781,6 +833,22 @@ class TransformersBackend:
                         mod_name.replace(".language_model.model.", ".language_model.", 1),
                         self.tensor_index[mod_name])
 
+            # MLX packs follow the mlx-lm module tree, where a multimodal wrapper holds the whole
+            # CausalLM as language_model ("language_model.model.layers.*", "language_model.lm_head.*")
+            if self.mlx is not None:
+                for ck_name, fn in raw_map.items():
+                    if ck_name.startswith("language_model."):
+                        self.tensor_index.setdefault(ck_name[len("language_model."):], (fn, ck_name))
+
+            # mlx-lm rewrites some tensors when it converts a checkpoint, and packs store the
+            # rewritten form. Conv kernels are channels-last (any model; undone by shape in
+            # _materialize). Qwen3.5's zero-centered RMSNorm gains are stored as 1 + weight
+            self.mlx_norm_shift = ()
+            if self.mlx is not None and any(mt.startswith("qwen3_5") for mt in model_types):
+                self.mlx_norm_shift = (
+                    ".input_layernorm.weight", ".post_attention_layernorm.weight", "model.norm.weight",
+                    ".q_norm.weight", ".k_norm.weight")
+
             # Real (init-valued) buffers up front on the compute device
             for m in self.model.modules():
                 for k, b in m._buffers.items():
@@ -803,7 +871,7 @@ class TransformersBackend:
 
             self.prefix = {id(m): n for n, m in self.model.named_modules()}
             # Tied-head fallback: the output embedding's weight is not in the shards when tied
-            head = self.model.get_output_embeddings()
+            _, head = self._text_parts()
             embed = self.model.get_input_embeddings()
             self.head_weight_name = f"{self.prefix[id(head)]}.weight" if head is not None else None
             self.embed_weight_name = f"{self.prefix[id(embed)]}.weight"
@@ -813,24 +881,30 @@ class TransformersBackend:
                 self.model.eval()
         else:
             trc = trust_remote_code(options, source)
-            try:
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    source,
-                    dtype = dtype,
-                    device_map = options.get("device_map", "auto"),
-                    trust_remote_code = trc,
-                )
-            except ValueError as e:
-                if "trust_remote_code" in str(e):
-                    raise _remote_code_hint(e, source) from e
-                from transformers import AutoModelForImageTextToText
-                self.model = AutoModelForImageTextToText.from_pretrained(
-                    source,
-                    dtype = dtype,
-                    device_map = options.get("device_map", "auto"),
-                    trust_remote_code = trc,
-                )
+            # model_class: image_text_to_text loads the multimodal wrapper even where a text-only
+            # CausalLM class exists. Needed when a quantized checkpoint's module paths only match the
+            # wrapper (AutoRound/GPTQ block_name_to_quantize = model.language_model.layers): under
+            # the CausalLM class nothing gets replaced and the packed weights silently go unloaded
+            from transformers import AutoModelForImageTextToText
+            model_class = options.get("model_class", "causal_lm")
+            assert model_class in ("causal_lm", "image_text_to_text"), f"Unknown model_class: {model_class}"
+            load_args = dict(
+                dtype = dtype,
+                device_map = options.get("device_map", "auto"),
+                trust_remote_code = trc,
+            )
+            if model_class == "image_text_to_text":
+                self.model = AutoModelForImageTextToText.from_pretrained(source, **load_args)
+            else:
+                try:
+                    self.model = AutoModelForCausalLM.from_pretrained(source, **load_args)
+                except ValueError as e:
+                    if "trust_remote_code" in str(e):
+                        raise _remote_code_hint(e, source) from e
+                    self.model = AutoModelForImageTextToText.from_pretrained(source, **load_args)
             self.model.eval()
+
+        self.time_step_limit = self._apply_time_step_limit(options.get("time_step_limit"))
 
         self.settings = {
             "dtype": str(dtype).replace("torch.", ""),
@@ -845,7 +919,12 @@ class TransformersBackend:
         else:
             self.settings["device_map"] = options.get("device_map", "auto")
         if self.w4a4_sim:
-            self.settings["w4a4_sim"] = True
+            n_scales = sum(k.endswith(".input_scale") for k in self.tensor_index)
+            if not n_scales:
+                raise ValueError("w4a4_sim: the checkpoint carries no input_scale sidecars")
+            self.settings["w4a4_sim"] = f"{n_scales} input scales in checkpoint"
+        if self.time_step_limit is not None:
+            self.settings["time_step_limit"] = self.time_step_limit
         self.settings["modeling"] = self._modeling_source(source)
         import transformers
         self.settings["transformers"] = transformers.__version__
@@ -1217,12 +1296,65 @@ class TransformersBackend:
             numel += wq.numel() * (wq.element_size() * 8 // int(nbits))
         return bits, numel
 
+    def _apply_time_step_limit(self, spec):
+        """Set the runtime dt clamp of every mixer that has one. spec: "config" takes the first
+        time_step_limit found on the model's config or its nested configs; a [min, max] pair is
+        used as given (max may be "inf"). Returns the limit applied, as a string for the settings
+        printout, or None"""
+        if spec is None:
+            return None
+        from transformers import PretrainedConfig
+        if spec == "config":
+            cfgs = [self.model.config] + [v for v in vars(self.model.config).values() if isinstance(v, PretrainedConfig)]
+            lim = next((getattr(c, "time_step_limit") for c in cfgs if getattr(c, "time_step_limit", None) is not None), None)
+            if lim is None:
+                raise ValueError("time_step_limit: config declares no time_step_limit")
+        else:
+            lim = spec
+        lim = tuple(float(v) for v in lim)
+        assert len(lim) == 2, "time_step_limit: [min, max]"
+        n = 0
+        for m in self.model.modules():
+            if hasattr(m, "time_step_limit"):
+                m.time_step_limit = lim
+                n += 1
+        if not n:
+            raise ValueError("time_step_limit: no module with a time_step_limit attribute")
+        return f"[{lim[0]:g}, {lim[1]:g}] ({n} mixers)"
+
+    def _text_parts(self):
+        """(base, head): the module whose forward returns last_hidden_state, and the output
+        embedding. Multimodal wrappers that nest a bare text model expose both through the usual
+        base_model / get_output_embeddings; wrappers that nest a complete causal LM under
+        language_model (NemotronH Omni: a *ForCausalLM with its own lm_head, and no
+        base_model_prefix of their own) are descended into"""
+        m = self.model
+        while True:
+            base = getattr(m, "base_model", m)
+            if base is not m:
+                m = base
+                continue
+            lm = getattr(m, "language_model", None)
+            if lm is None or getattr(lm, "get_output_embeddings", lambda: None)() is None:
+                break
+            m = lm
+        head = self.model.get_output_embeddings()
+        if head is None:
+            inner = self.model
+            while head is None and getattr(inner, "language_model", None) is not None:
+                inner = inner.language_model
+                head = inner.get_output_embeddings()
+        return m, head
+
     def _decoder_layers(self):
-        """The decoder layer list: the largest ModuleList that no other candidate ModuleList
-        contains. Per-expert MoE implementations (Ling) hold a ModuleList of hundreds of
-        experts inside every layer, which would win on size alone; the layer list is the
-        outermost one. Mixed child types are allowed (Ling appends its MTP layer to the list)"""
-        lists = [m for m in self.model.modules() if isinstance(m, torch.nn.ModuleList) and len(m) >= 4]
+        """The decoder layer list: the largest ModuleList under the text base that no other
+        candidate ModuleList contains. Per-expert MoE implementations (Ling) hold a ModuleList
+        of hundreds of experts inside every layer, which would win on size alone; the layer
+        list is the outermost one. Mixed child types are allowed (Ling appends its MTP layer
+        to the list). Searching the text base only keeps a vision tower's block list (deeper
+        than a short text stack) out of the running"""
+        base, _ = self._text_parts()
+        lists = [m for m in base.modules() if isinstance(m, torch.nn.ModuleList) and len(m) >= 4]
         inner = set()
         for m in lists:
             for sub in m.modules():
@@ -1243,11 +1375,7 @@ class TransformersBackend:
         def make(li):
             def hook(module, inputs, output):
                 out = output[0] if isinstance(output, tuple) else output
-                g = gens.get(out.device)
-                if g is None:
-                    g = gens[out.device] = torch.Generator(device = out.device)
-                g.manual_seed(noise_seed(row_of(), li))
-                out = apply_mult_noise(out, noise_eps, g)
+                out = apply_mult_noise(out, noise_eps, gens, noise_seed(row_of(), li))
                 if isinstance(output, tuple):
                     return (out,) + output[1:]
                 return out
@@ -1320,6 +1448,40 @@ class TransformersBackend:
                 zp = zp - (1 << (bits - 1))
             q = q - zp.repeat_interleave(group, dim = 1)
         return q.to(torch.float32) * scale.repeat_interleave(group, dim = 1)
+
+    def _dequant_mlx(self, stem):
+        """Dequantize an MLX affine weight (mlx.core.quantize): unsigned ints packed LSB-first
+        into one contiguous bitstream of uint32 words per row, w = q * scale + bias with a scale
+        and a bias per group of inputs. The bit width follows from the shapes, so a mixed pack
+        only needs its per-module group sizes. Runs on the compute device in row chunks and
+        returns the compute dtype: embedding and head tables are too large to unpack in one piece"""
+        packed = self._read_shard(f"{stem}.weight").view(torch.int32)
+        scales = self._read_shard(f"{stem}.scales")
+        biases = self._read_shard(f"{stem}.biases")
+        assert packed.ndim == 2 and scales.shape == biases.shape, f"{stem}: unexpected MLX quantized layout"
+        ck_stem = self.tensor_index[f"{stem}.weight"][1][:-len(".weight")]
+        spec = self.mlx.get(ck_stem)
+        spec = spec if isinstance(spec, dict) else self.mlx
+        gs = spec["group_size"]
+        rows, words = packed.shape
+        n = scales.shape[1] * gs
+        bits = words * 32 // n
+        assert bits * n == words * 32 and bits == spec.get("bits", bits), \
+            f"{stem}: {words} words per row do not hold {n} values of {spec.get('bits')} bits"
+        dev = self.device
+        offs = torch.arange(n, device = dev, dtype = torch.int64) * bits
+        w0, sh = offs >> 5, offs & 31
+        out = torch.empty((rows, n), dtype = self.dtype, device = dev)
+        step = max(1, (1 << 27) // n)
+        for a in range(0, rows, step):
+            p = packed[a : a + step].to(dev).to(torch.int64) & 0xFFFFFFFF
+            p = torch.nn.functional.pad(p, (0, 1))
+            q = ((p[:, w0] | (p[:, w0 + 1] << 32)) >> sh) & ((1 << bits) - 1)
+            w = q.to(torch.float32).view(-1, n // gs, gs)
+            w = w * scales[a : a + step].to(dev, torch.float32).unsqueeze(-1)
+            w += biases[a : a + step].to(dev, torch.float32).unsqueeze(-1)
+            out[a : a + step] = w.view(-1, n)
+        return out
 
     # fp4 e2m1 magnitudes for codes 0-7; codes 8-15 mirror negative (sign is the msb)
     NVFP4_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
@@ -1430,7 +1592,8 @@ class TransformersBackend:
             if name.endswith(".weight"):
                 # ModelOpt-style scale sidecars stored next to the weight itself
                 stem = name[:-len(".weight")]
-                for s in ("weight_scale", "weight_scale_2", "weight_scale_inv", "input_scale", "input_global_scale", "scale"):
+                for s in ("weight_scale", "weight_scale_2", "weight_scale_inv", "input_scale", "input_global_scale", "scale",
+                          "scales", "biases"):
                     if f"{stem}.{s}" in self.tensor_index:
                         total += 8 * self._nbytes(f"{stem}.{s}")
             # Underscore sidecars on suffix-less fused tensors (fp8 expert stacks)
@@ -1460,10 +1623,10 @@ class TransformersBackend:
                 total += sum(8 * self._nbytes(k) for k in self.tensor_index if pat.match(k))
             if total:
                 return total
-        fm = re.match(r"^(.*\.experts)\.(gate_up_proj|down_proj)$", name)
+        fm = re.match(r"^(.*\.experts)\.(gate_up_proj|up_proj|down_proj)$", name)
         if fm:
             prefix, kind = fm.group(1), fm.group(2)
-            parts = ("down",) if kind == "down_proj" else ("gate", "up")
+            parts = {"down_proj": ("down",), "up_proj": ("up",), "gate_up_proj": ("gate", "up")}[kind]
             pat = re.compile(
                 "^" + re.escape(prefix) + r"\.\d+\.(" + "|".join(parts) +
                 r")_proj\.(weight(_packed|_scale|_scale_inv|_zero_point|_shape|_g_idx)?|qweight|qzeros|scales)$")
@@ -1475,6 +1638,9 @@ class TransformersBackend:
     def _get_tensor(self, name):
         import re
         if name in self.tensor_index:
+            if self.mlx is not None and name.endswith(".weight") \
+                    and f"{name[:-len('.weight')]}.scales" in self.tensor_index:
+                return self._dequant_mlx(name[:-len(".weight")])
             # ModelOpt, ct-float-quantized and fp8 keep the quantized tensor under the plain
             # .weight name; the scale sidecar marks it as needing dequant. Fused fp8 expert
             # tensors (Mistral-Small-4 experts.gate_up_proj etc.) carry the same _scale_inv
@@ -1598,8 +1764,17 @@ class TransformersBackend:
                 shims.append(pn)
                 continue
             t = self._get_tensor(full)
-            keep_fp32 = t.dtype == torch.float32 and self._plain_fp32(full)
-            if keep_fp32 and getattr(self, "awq_bits", None) and param.dtype != torch.float32:
+            mlx_fp32 = False
+            if self.mlx is not None:
+                if t.ndim >= 3 and t.shape != param.shape:
+                    t = t.movedim(-1, 1)
+                if t.ndim == 1 and full.endswith(self.mlx_norm_shift):
+                    # Kept in fp32: the difference is not always representable in bf16, and the
+                    # norm adds the 1 back in fp32, which restores the stored gain exactly
+                    t = t.float() - 1.0
+                    mlx_fp32 = True
+            keep_fp32 = t.dtype == torch.float32 and (mlx_fp32 or self._plain_fp32(full))
+            if keep_fp32 and not mlx_fp32 and getattr(self, "awq_bits", None) and param.dtype != torch.float32:
                 # AutoAWQ exporters store some unquantized tensors fp32 that the model keeps in its
                 # own dtype (QuantTrio's Qwen3.6-35B-A3B: every router, which then met bf16 hidden
                 # states). Scoped to AWQ so no other checkpoint's, nor the bf16 reference's,
@@ -1634,46 +1809,68 @@ class TransformersBackend:
         v = lut[torch.bucketize(q.abs().clamp(max = 6.0), mid)] * q.sign()
         return (v * sg).reshape(x.shape).to(x.dtype)
 
+    def _fp8_fq(self, x, s):
+        """Static per-tensor FP8 fake-quant (ModelOpt FP8 recipe): e4m3 values of x / s, saturated
+        at the e4m3 range, scaled back. Returns x.dtype."""
+        return ((x.float() / s).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float() * s).to(x.dtype)
+
     def _install_a4_wraps(self, module, prefix):
-        """Wrap fused-expert modules (Qwen3Next-style forward(hidden, top_k_index,
-        top_k_weights)) with per-expert activation fake-quant, when the checkpoint carries
-        per-expert input_scale tensors for them."""
+        """Emulate the checkpoint's static activation quantization where it declares input
+        scales. Fused-expert modules with a forward(hidden, top_k_index, top_k_weights), gated
+        (Qwen3Next-style gate_up_proj) or gateless (NemotronH up_proj), get per-expert NVFP4
+        fake-quant on both GEMM inputs when the checkpoint carries per-expert input_scale
+        tensors; plain fp8 Linears (scalar weight_scale, no weight_scale_2) get a per-tensor e4m3
+        fake-quant of their input. Modules without input scales are left alone and counted
+        nowhere, so a4_count stays 0 for a checkpoint the simulation does not cover."""
         import torch.nn.functional as F
         for name, sub in module.named_modules():
             pset = dict(sub.named_parameters(recurse = False))
-            if "gate_up_proj" not in pset or "down_proj" not in pset:
-                continue
-            stem = f"{prefix}.{name}" if prefix else name
-            E = pset["gate_up_proj"].shape[0]
-            if f"{stem}.0.gate_proj.input_scale" not in self.tensor_index:
-                continue
-            gs = torch.tensor([float(self._read_shard(f"{stem}.{e}.gate_proj.input_scale"))
-                               for e in range(E)])
-            ds = torch.tensor([float(self._read_shard(f"{stem}.{e}.down_proj.input_scale"))
-                               for e in range(E)])
-            orig = sub.forward
+            # The root module (a materialized lm_head) comes back with an empty name
+            stem = ".".join(part for part in (prefix, name) if part)
+            gated = "gate_up_proj" in pset
+            if (gated or "up_proj" in pset) and "down_proj" in pset and pset["down_proj"].dim() == 3:
+                E = pset["down_proj"].shape[0]
+                first = "gate" if gated else "up"
+                if f"{stem}.0.{first}_proj.input_scale" not in self.tensor_index:
+                    continue
+                us = torch.tensor([float(self._read_shard(f"{stem}.{e}.{first}_proj.input_scale"))
+                                   for e in range(E)])
+                ds = torch.tensor([float(self._read_shard(f"{stem}.{e}.down_proj.input_scale"))
+                                   for e in range(E)])
+                orig = sub.forward
 
-            def a4_forward(hidden_states, top_k_index, top_k_weights, _m = sub, _gs = gs, _ds = ds):
-                final = torch.zeros_like(hidden_states)
-                with torch.no_grad():
-                    mask = F.one_hot(top_k_index, num_classes = _m.num_experts).permute(2, 1, 0)
-                    hit = torch.greater(mask.sum(dim = (-1, -2)), 0).nonzero()
-                for e in hit:
-                    e = int(e[0])
-                    if e == _m.num_experts:
-                        continue
-                    pos, tok = torch.where(mask[e])
-                    cs = self._nvfp4_fq(hidden_states[tok], float(_gs[e]))
-                    gate, up = F.linear(cs, _m.gate_up_proj[e]).chunk(2, dim = -1)
-                    h = _m.act_fn(gate) * up
-                    h = self._nvfp4_fq(h, float(_ds[e]))
-                    h = F.linear(h, _m.down_proj[e])
-                    h = h * top_k_weights[tok, pos, None]
-                    final.index_add_(0, tok, h.to(final.dtype))
-                return final
+                def a4_forward(hidden_states, top_k_index, top_k_weights, _m = sub, _us = us, _ds = ds, _gated = gated):
+                    final = torch.zeros_like(hidden_states)
+                    with torch.no_grad():
+                        # One spare class: routers that pad with the expert count as a sentinel
+                        mask = F.one_hot(top_k_index, num_classes = _m.num_experts + 1).permute(2, 1, 0)
+                        hit = torch.greater(mask.sum(dim = (-1, -2)), 0).nonzero()
+                    for e in hit:
+                        e = int(e[0])
+                        if e == _m.num_experts:
+                            continue
+                        pos, tok = torch.where(mask[e])
+                        cs = self._nvfp4_fq(hidden_states[tok], float(_us[e]))
+                        if _gated:
+                            gate, up = F.linear(cs, _m.gate_up_proj[e]).chunk(2, dim = -1)
+                            h = _m.act_fn(gate) * up
+                        else:
+                            h = _m.act_fn(F.linear(cs, _m.up_proj[e]))
+                        h = self._nvfp4_fq(h, float(_ds[e]))
+                        h = F.linear(h, _m.down_proj[e])
+                        h = h * top_k_weights[tok, pos, None]
+                        final.index_add_(0, tok, h.to(final.dtype))
+                    return final
 
-            sub.forward = a4_forward
-            self.a4_wraps.append((sub, orig))
+                sub.forward = a4_forward
+                self.a4_wraps.append((sub, orig))
+                self.a4_count[0] += 1
+            elif isinstance(sub, torch.nn.Linear) and f"{stem}.input_scale" in self.tensor_index \
+                    and f"{stem}.weight_scale" in self.tensor_index and f"{stem}.weight_scale_2" not in self.tensor_index:
+                s8 = float(self._read_shard(f"{stem}.input_scale"))
+                self.a4_hooks.append(sub.register_forward_pre_hook(
+                    lambda m, args, _s = s8: (self._fp8_fq(args[0], _s),) + tuple(args[1:])))
+                self.a4_count[1] += 1
 
     def _install_shard_shim(self, module, prefix, pn):
         stem_local = pn[: -len(".weight")]
@@ -1695,6 +1892,8 @@ class TransformersBackend:
         while self.a4_wraps:
             sub, orig = self.a4_wraps.pop()
             sub.forward = orig
+        while self.a4_hooks:
+            self.a4_hooks.pop().remove()
         while self.shard_shims:
             parent, name, orig = self.shard_shims.pop()
             parent._modules[name] = orig            # original keeps its meta weight
@@ -1705,10 +1904,9 @@ class TransformersBackend:
 
     @torch.inference_mode()
     def _run_streaming(self, ids: torch.Tensor, callback, noise_eps: float = None, ranges: list = None, row_ids: list = None):
-        base = self.model.base_model
+        base, head = self._text_parts()
         layers = self._decoder_layers()
         embed = self.model.get_input_embeddings()
-        head = self.model.get_output_embeddings()
 
         # Hook the embedding, every decoder layer, and every other weight-carrying module found
         # by walking the base tree - recursing into containers that hold the special modules
@@ -1872,6 +2070,10 @@ class TransformersBackend:
                     raise st["error"]
 
                 self._materialize(head)
+                if self.w4a4_sim:
+                    n_exp, n_lin = self.a4_count
+                    print(f" -- w4a4_sim: {n_exp} expert modules, {n_lin} fp8 linears fake-quantized" +
+                          ("" if n_exp or n_lin else "  !! nothing matched the checkpoint's input scales"))
                 results = {}
                 for b, rs in enumerate(batches):
                     for i, r in enumerate(rs):

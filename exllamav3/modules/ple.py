@@ -8,6 +8,7 @@ from .module import Module
 from .linear import Linear
 from .rmsnorm import RMSNorm
 from .ngram_embedding import NGramEmbedding
+from .hyperconnections import hc_flush
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
@@ -28,6 +29,16 @@ the caller:  streams <- streams + ple(streams, token_history).
 Recurrent state per sequence: the (kernel-1)*dilation trailing positions of the normed gated
 values (conv_state), plus the ngram_size-1 previous token ids (carried in token_history by the
 caller). Norms are grouped RMS (rms per 2560-stream, zero-init weight applied as 1 + w).
+
+DeepSeek-V4.1's Engram layers are the same gate without the conv (conv_kernel_size 0): one
+projection of the n-gram rows gives the keys and the value together (kv_proj_key), the norms
+carry plain weights, and the ids are hashed through a token map that folds tokens normalizing
+alike (" The", "the", "THE") onto one id, with a pad id in place of the eos marker.
+
+Hy4's Engram layers are conv-less too, with separate key and value projections. Each looked-up
+row is normalized with its hash head's weight first (head_norm_keys), the value is normalized
+and scaled (value_norm_key), and every stream adds a learned multiple of that value next to the
+gated one (branch_scale_keys):  delta[h] = (gate[h] + branch[h]) * value.
 """
 
 
@@ -144,9 +155,44 @@ class PLELayer(Module):
         stream_from_disk: bool | None = None,
         out_dtype: torch.dtype | None = None,
         mm_token_id: int | None = None,
+        mm_gate_off: bool = False,
         submodules: dict | None = None,
         stub: bool = False,
+        ngram_key: str | None = None,
+        kv_proj_key: str | None = None,
+        norm_keys: tuple[str, str, str] = ("norm_key", "norm_query", "norm_conv"),
+        norm_constant_bias: float = 1.0,
+        norm_weight_suffix: bool = True,
+        token_map: torch.Tensor | None = None,
+        hash_params: tuple | None = None,
+        key_proj_alt: list[str] | None = None,
+        norm_alt_keys: tuple | None = None,
+        head_norm_keys: list[str] | None = None,
+        value_norm_key: str | None = None,
+        branch_scale_keys: list[str] | None = None,
+        off_token_id: int | None = None,
+        ngram_segment: bool = True,
+        ngram_fp8_rows: bool = False,
+        stateless: bool = False,
+        token_map_key: str | None = None,
     ):
+        """
+        ngram_key: the n-gram table's key (default {key}.ple_embedding.ngram_embedding). kv_proj_key: one
+        projection {key}.{kv_proj_key} of the rows to [hc_mult keys | value] in place of key_proj/value_proj.
+        norm_keys: the key/query/conv norm tensor keys under {key}, applied as (norm_constant_bias + w),
+        with or without a .weight suffix. token_map: (vocab) long CPU, applied to the ids before hashing. hash_params: the
+        (head_vocab_sizes, layer_multipliers) the table was built with, when the checkpoint does not
+        carry them. conv_kernel_size 0: no conv, no conv state.
+        key_proj_alt: full keys of per-stream key projections to load as one. norm_alt_keys: per-stream
+        weight tensors (full keys) of the key and the query norm, stacked at load. head_norm_keys: one
+        weight tensor per hash head (full keys) for a norm over each looked-up row. value_norm_key: weight
+        of a norm over the projected value. branch_scale_keys: per-stream (hidden) vectors, see above.
+        off_token_id: rows holding this token take no update. ngram_segment / ngram_fp8_rows: see
+        NGramEmbedding. stateless: no recurrent state; the ids before the input come with the forward
+        (params["prev_ids"]), for conv-less layers in models that keep no other recurrent state.
+        token_map_key: the checkpoint tensor {key}.{token_map_key} the token map came from, carried into
+        a converted model
+        """
         super().__init__(config = config, key = key, qmap = None)
         self.hidden_size = hidden_size
         self.ple_embed_dim = ple_embed_dim
@@ -156,11 +202,32 @@ class PLELayer(Module):
         self.rms_norm_eps = rms_norm_eps
         self.hc_mult = hc_mult
         self.mm_token_id = mm_token_id
+        # Image rows take no update (the reference Engram shuts its gate inside an image span)
+        self.mm_gate_off = mm_gate_off
         self.conv_kernel_size = conv_kernel_size
         self.conv_dilation = ngram_size
-        self.conv_state_len = (conv_kernel_size - 1) * self.conv_dilation
+        self.conv_state_len = max(conv_kernel_size - 1, 0) * self.conv_dilation
         self.gate_scale = 1.0 / math.sqrt(hidden_size)
         self.out_dtype = out_dtype
+        self.kv_proj_key = kv_proj_key
+        self.norm_keys = tuple(norm_keys)
+        self.norm_constant_bias = norm_constant_bias
+        self.norm_weight_suffix = norm_weight_suffix
+        self.token_map = token_map
+        self.hash_params = hash_params
+        self.ngram_key = ngram_key or f"{key}.ple_embedding.ngram_embedding"
+        self.key_proj_alt = key_proj_alt
+        self.norm_alt_keys = norm_alt_keys
+        self.head_norm_keys = head_norm_keys
+        self.value_norm_key = value_norm_key
+        self.branch_scale_keys = branch_scale_keys
+        self.off_token_id = off_token_id
+        self.ngram_segment = ngram_segment
+        self.ngram_fp8_rows = ngram_fp8_rows
+        self.stateless = stateless
+        self.token_map_key = token_map_key
+        assert not stateless or not conv_kernel_size, "a stateless PLE layer cannot carry conv state"
+        self.branch_scales = None
         hc_hidden = hc_mult * hidden_size
 
         # TP rank that does not own the layer (allocation max_devices = 1): no submodules, no
@@ -170,8 +237,8 @@ class PLELayer(Module):
         self.stub = stub
         self.tp_owner = None
         if stub:
-            self.ple_embedding = self.key_proj = self.value_proj = None
-            self.norm_key = self.norm_query = self.norm_conv = None
+            self.ple_embedding = self.key_proj = self.value_proj = self.kv_proj = None
+            self.norm_key = self.norm_query = self.norm_conv = self.head_norm = self.value_norm = None
             self.layer_idx = layer_idx
             self.layer_state_cls = PLELayerState
             self.recurrent_layers = []
@@ -187,43 +254,68 @@ class PLELayer(Module):
 
         self.ple_embedding = _sub("ple_embedding", lambda: NGramEmbedding(
             config = config,
-            key = f"{key}.ple_embedding.ngram_embedding",
+            key = self.ngram_key,
             ngram_size = ngram_size,
             heads_per_ngram = heads_per_ngram,
             ple_embed_dim = ple_embed_dim,
             eos_token_id = eos_token_id,
             stream_from_disk = stream_from_disk,
+            head_vocab_sizes = hash_params[0] if hash_params else None,
+            layer_multipliers = hash_params[1] if hash_params else None,
+            segment = ngram_segment,
+            fp8_rows = ngram_fp8_rows,
         ))
-        self.key_proj = _sub("key_proj", lambda: Linear(
-            config = config,
-            key = f"{key}.key_proj",
-            in_features = ple_embed_dim,
-            out_features = hc_hidden,
-            qmap = qmap,
-            out_dtype = torch.half,
-        ))
-        self.value_proj = _sub("value_proj", lambda: Linear(
-            config = config,
-            key = f"{key}.value_proj",
-            in_features = ple_embed_dim,
-            out_features = hidden_size,
-            qmap = qmap,
-            out_dtype = torch.half,
-        ))
+        if kv_proj_key is not None:
+            self.key_proj = self.value_proj = None
+            self.kv_proj = _sub("kv_proj", lambda: Linear(
+                config = config,
+                key = f"{key}.{kv_proj_key}",
+                in_features = ple_embed_dim,
+                out_features = hc_hidden + hidden_size,
+                qmap = qmap,
+                out_dtype = torch.half,
+            ))
+        else:
+            self.kv_proj = None
+            self.key_proj = _sub("key_proj", lambda: Linear(
+                config = config,
+                key = f"{key}.key_proj",
+                alt_key = key_proj_alt,
+                in_features = ple_embed_dim,
+                out_features = hc_hidden,
+                qmap = qmap,
+                out_dtype = torch.half,
+            ))
+            self.value_proj = _sub("value_proj", lambda: Linear(
+                config = config,
+                key = f"{key}.value_proj",
+                in_features = ple_embed_dim,
+                out_features = hidden_size,
+                qmap = qmap,
+                out_dtype = torch.half,
+            ))
         # Grouped RMS norms over the stream stack (weight is hc_mult rows of hidden channels,
-        # zero-init, applied as 1 + w)
-        def norm(name):
-            return RMSNorm(config, f"{key}.{name}", rms_norm_eps, constant_bias = 1.0,
-                           groups = hc_mult)
-        self.norm_key = _sub("norm_key", lambda: norm("norm_key"))
-        self.norm_query = _sub("norm_query", lambda: norm("norm_query"))
-        self.norm_conv = _sub("norm_conv", lambda: norm("norm_conv"))
+        # zero-init, applied as 1 + w; or plain weights)
+        def norm(name, alt = None):
+            return RMSNorm(config, f"{key}.{name}", rms_norm_eps, constant_bias = norm_constant_bias,
+                           groups = hc_mult, tensor_weight_suffix = norm_weight_suffix, alt_keys = alt)
+        self.norm_key = _sub("norm_key", lambda: norm(self.norm_keys[0], norm_alt_keys[0] if norm_alt_keys else None))
+        self.norm_query = _sub("norm_query", lambda: norm(self.norm_keys[1], norm_alt_keys[1] if norm_alt_keys else None))
+        self.norm_conv = _sub("norm_conv", lambda: norm(self.norm_keys[2])) if conv_kernel_size else None
+        # Per-row norm of the looked-up embeddings, one weight row per hash head
+        self.head_norm = _sub("head_norm", lambda: RMSNorm(
+            config, f"{key}.head_norm", rms_norm_eps, groups = self.ple_embedding.num_heads,
+            alt_keys = head_norm_keys, out_dtype = torch.half,
+        )) if head_norm_keys else None
+        self.value_norm = _sub("value_norm", lambda: RMSNorm(
+            config, f"{key}.{value_norm_key}", rms_norm_eps, tensor_weight_suffix = False, out_dtype = torch.half,
+        )) if value_norm_key else None
 
         # Recurrent state registration: negative layer_idx keeps the state key distinct from the
         # decoder block that shares this layer index in the cache's recurrent-layer map
         assert layer_idx < 0
         self.layer_idx = layer_idx
-        self.caps.update({"recurrent_cache": True, "prefetch_ids": True})
+        self.caps.update({"prefetch_ids": True} if stateless else {"recurrent_cache": True, "prefetch_ids": True})
         self.layer_state_cls = PLELayerState
         self.recurrent_layers = []
         self.tp_recurrent_lookup = {}
@@ -235,8 +327,18 @@ class PLELayer(Module):
         super().load(device, **kwargs)
         for rl in self.recurrent_layers:
             rl.alloc(device)
-        self.conv_w = self.config.stc.get_tensor(f"{self.key}.conv1d.weight", device,
-                                                 float2half = True, no_defer = True).contiguous()
+        if self.conv_kernel_size:
+            self.conv_w = self.config.stc.get_tensor(f"{self.key}.conv1d.weight", device,
+                                                     float2half = True, no_defer = True).contiguous()
+        if self.branch_scale_keys:
+            stc = self.config.stc
+            name = f"{self.key}.branch_scales"
+            if stc.has_tensor(name):
+                self.branch_scales = stc.get_tensor(name, device, no_defer = True, allow_bf16 = True).float().contiguous()
+            else:
+                self.branch_scales = torch.stack([
+                    stc.get_tensor(k, device, no_defer = True, allow_bf16 = True).float() for k in self.branch_scale_keys
+                ]).contiguous()
 
     @override
     def unload(self):
@@ -244,12 +346,18 @@ class PLELayer(Module):
             rl.free()
         super().unload()
         self.conv_w = None
+        self.branch_scales = None
 
     @override
     def get_tensors(self):
-        return {
-            f"{self.key}.conv1d.weight": self.conv_w.contiguous(),
-        }
+        t = {}
+        if self.conv_kernel_size:
+            t[f"{self.key}.conv1d.weight"] = self.conv_w.contiguous()
+        if self.branch_scales is not None:
+            t[f"{self.key}.branch_scales"] = self.branch_scales.half().contiguous()
+        if self.token_map_key is not None and self.token_map is not None:
+            t[f"{self.key}.{self.token_map_key}"] = self.token_map.int().contiguous()
+        return t
 
     @override
     def weights_numel(self):
@@ -258,12 +366,23 @@ class PLELayer(Module):
         # whose table lives out-of-line in ngram_embedding.safetensors and accounts for itself.
         # Shape-derived, since conversion reads the count after unload()
         hc_hidden = self.hc_mult * self.hidden_size
-        return self.key_proj.weights_numel() + self.value_proj.weights_numel() \
-            + 3 * hc_hidden + hc_hidden * self.conv_kernel_size
+        n = sum(m.weights_numel() for m in self._projections()) + 2 * hc_hidden
+        if self.conv_kernel_size:
+            n += hc_hidden + hc_hidden * self.conv_kernel_size
+        if self.head_norm_keys:
+            n += self.ple_embed_dim
+        if self.value_norm_key:
+            n += self.hidden_size
+        if self.branch_scale_keys:
+            n += hc_hidden
+        return n
+
+    def _projections(self):
+        return [m for m in (self.kv_proj, self.key_proj, self.value_proj) if m is not None]
 
     @override
     def optimizer_targets(self):
-        return self.key_proj.optimizer_targets() + self.value_proj.optimizer_targets()
+        return sum((m.optimizer_targets() for m in self._projections()), [])
 
     # Tensor-parallel: the layer adds to the replicated residual stream stack from the token ids
     # alone, so nothing in it splits. It runs whole on ONE rank (allocation max_devices = 1)
@@ -272,14 +391,16 @@ class PLELayer(Module):
     # matmuls whose kernel choice, and so rounding, depends on the device), and the n-gram hash
     # and disk gather run once instead of once per rank. The recurrent state lives on the
     # owner only
-    _tp_submodules = ("ple_embedding", "key_proj", "value_proj", "norm_key", "norm_query", "norm_conv")
+    _tp_submodules = ("ple_embedding", "key_proj", "value_proj", "kv_proj", "norm_key", "norm_query", "norm_conv")
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         stc = self.config.stc
-        storage = self.key_proj.storage_size() + self.value_proj.storage_size()
+        storage = sum(m.storage_size() for m in self._projections())
         for n in ("norm_key", "norm_query", "norm_conv"):
-            storage += sum(stc.get_tensor_sizes(getattr(self, n).key))
-        storage += sum(stc.get_tensor_sizes(f"{self.key}.conv1d"))
+            if getattr(self, n) is not None:
+                storage += sum(stc.get_tensor_sizes(getattr(self, n).key))
+        if self.conv_kernel_size:
+            storage += sum(stc.get_tensor_sizes(f"{self.key}.conv1d"))
         for rl in self.recurrent_layers:
             storage += rl.storage_size()
         hc_hidden = self.hc_mult * self.hidden_size
@@ -312,9 +433,21 @@ class PLELayer(Module):
                 "rms_norm_eps": self.rms_norm_eps,
                 "out_dtype": self.out_dtype,
                 "mm_token_id": self.mm_token_id,
+                "mm_gate_off": self.mm_gate_off,
+                "ngram_key": self.ngram_key,
+                "kv_proj_key": self.kv_proj_key,
+                "norm_keys": self.norm_keys,
+                "norm_constant_bias": self.norm_constant_bias,
+                "norm_weight_suffix": self.norm_weight_suffix,
+                "hash_params": self.hash_params,
+                "off_token_id": self.off_token_id,
+                "ngram_segment": self.ngram_segment,
+                "ngram_fp8_rows": self.ngram_fp8_rows,
+                "stateless": self.stateless,
             },
-            **{n: getattr(self, n).tp_export(plan, producer) for n in self._tp_submodules},
-            "conv_w": producer.send(self.conv_w),
+            **{n: getattr(self, n).tp_export(plan, producer) for n in self._tp_submodules if getattr(self, n) is not None},
+            "token_map": producer.send(self.token_map) if self.token_map is not None else None,
+            "conv_w": producer.send(self.conv_w) if self.conv_w is not None else None,
             "recurrent_layers": [rl.tp_export(plan) for rl in self.recurrent_layers],
             "device": self.device,
         }
@@ -332,11 +465,13 @@ class PLELayer(Module):
             module.device = device
             module.tp_owner = module.tp_single_owner(local_context, key)
             return module
-        subs = {n: exported[n]["cls"].tp_import(local_context, exported[n], plan) for n in PLELayer._tp_submodules}
-        module = PLELayer(config = None, **exported["kwargs"], submodules = subs)
+        subs = {n: exported[n]["cls"].tp_import(local_context, exported[n], plan)
+                for n in PLELayer._tp_submodules if exported.get(n) is not None}
+        token_map = consumer.recv(exported["token_map"], cuda = False) if exported.get("token_map") is not None else None
+        module = PLELayer(config = None, **exported["kwargs"], submodules = subs, token_map = token_map)
         module.device = device
         module.tp_owner = module.tp_single_owner(local_context, key)
-        module.conv_w = consumer.recv(exported["conv_w"], cuda = True).contiguous()
+        module.conv_w = consumer.recv(exported["conv_w"], cuda = True).contiguous() if exported.get("conv_w") is not None else None
         for rl in exported["recurrent_layers"]:
             rli = rl["cls"](module, **rl["args"])
             rli.alloc(device)
@@ -380,7 +515,11 @@ class PLELayer(Module):
         bsz, seq = streams.shape[:2]
         H, D = self.hc_mult, self.hidden_size
         emb = self.ple_embedding.forward(token_history, params)               # (bsz, seq, ple_dim)
-        if self.key_proj.quant_type == "fp16" and self.value_proj.quant_type == "fp16" \
+        if self.head_norm is not None:
+            heads = self.ple_embedding.num_heads
+            emb = self.head_norm.forward(emb.view(bsz, seq, heads, -1), params, out_dtype = torch.half).flatten(-2)
+        if self.key_proj is not None and self.conv_kernel_size \
+                and self.key_proj.quant_type == "fp16" and self.value_proj.quant_type == "fp16" \
                 and streams.dtype == torch.float and streams.is_contiguous() \
                 and self.key_proj.inner.bias is None and self.value_proj.inner.bias is None:
             emb = emb.contiguous()
@@ -403,31 +542,66 @@ class PLELayer(Module):
                                           dtype = torch.half, device = streams.device)
                 ext.ple_forward_streams(
                     streams[:, t0:t1], emb[:, t0:t1],
-                    self.key_proj.inner.weight, self.value_proj.inner.weight,
+                    self.key_proj.inner.staged_weight(), self.value_proj.inner.staged_weight(),
                     self.norm_key.weight.data, self.norm_query.weight.data,
                     self.norm_conv.weight.data, self.conv_w,
                     cs,
                     self.norm_key.rms_norm_eps, self.gate_scale, self.conv_dilation,
                     delta, conv_stream,
                 )
+                keep = params.get("ple_keep_rows")
+                if keep is not None:
+                    delta.mul_(keep[:, t0:t1, None, None])
                 streams[:, t0:t1].add_(delta)
                 cs = conv_stream[:, :, -self.conv_state_len:].contiguous()
             return None, conv_stream
+        if self.kv_proj is not None and not self.conv_kernel_size \
+                and self.kv_proj.quant_type == "fp16" and self.kv_proj.inner.bias is None \
+                and streams.dtype == torch.float and streams.is_contiguous():
+            # Conv-less, one fused projection (DeepSeek-V4.1 Engram): the ext call runs the whole gate and
+            # the delta is added into the streams in place, slab by slab as above
+            emb = emb.contiguous()
+            sub = _ple_sub_range if _ple_sub_range > 0 else seq
+            slabs = [(0, seq)] if bsz > 1 or seq <= sub else [(t0, min(t0 + sub, seq)) for t0 in range(0, seq, sub)]
+            delta = None
+            for t0, t1 in slabs:
+                if delta is None or delta.shape[1] != t1 - t0:
+                    delta = torch.empty((bsz, t1 - t0, H, D), dtype = torch.float, device = streams.device)
+                ext.ple_forward_streams_fused(
+                    streams[:, t0:t1], emb[:, t0:t1], self.kv_proj.inner.staged_weight(),
+                    self.norm_key.weight.data, self.norm_query.weight.data,
+                    self.norm_key.rms_norm_eps, self.norm_key.constant_bias, self.gate_scale, delta,
+                )
+                keep = params.get("ple_keep_rows")
+                if keep is not None:
+                    delta.mul_(keep[:, t0:t1, None, None])
+                streams[:, t0:t1].add_(delta)
+            return None, None
         return self.forward_streams_reference(streams, emb, params, conv_state)
 
     def forward_streams_reference(self, streams, emb, params, conv_state = None):
         """Op-by-op form of forward_streams (torch + individual ext kernels)."""
         bsz, seq = streams.shape[:2]
         H, D = self.hc_mult, self.hidden_size
-        key = self.key_proj.forward(emb, params).view(bsz, seq, H, D)
+        if self.kv_proj is not None:
+            kv = self.kv_proj.forward(emb, params)
+            key, value = kv[..., :H * D].view(bsz, seq, H, D), kv[..., H * D:].contiguous()
+        else:
+            key = self.key_proj.forward(emb, params).view(bsz, seq, H, D)
+            value = self.value_proj.forward(emb, params)                      # (bsz, seq, hidden) fp16
+        if self.value_norm is not None:
+            value = self.value_norm.forward(value, params, out_dtype = torch.half)
         key = self.norm_key.forward(key, params, out_dtype = torch.float)
-        value = self.value_proj.forward(emb, params)                          # (bsz, seq, hidden) fp16
         query = self.norm_query.forward(streams, params, out_dtype = torch.float)
         # per-stream key/query dots as a batched (1, D) x (D, 1) matmul, then the fused gate
         # kernel: gated = sigmoid(signed_sqrt(dot * scale)) * value broadcast over streams
         gate = torch.bmm(query.view(-1, 1, D), key.reshape(-1, D, 1)).view(bsz, seq, H)
         gated = torch.empty((bsz, seq, H, D), dtype = torch.float, device = value.device)
         ext.ple_gate(gate, value, gated, self.gate_scale)
+        if self.branch_scales is not None:
+            gated.addcmul_(self.branch_scales, value.float().unsqueeze(2))
+        if not self.conv_kernel_size:
+            return gated, None
         normed = self.norm_conv.forward(gated, params, out_dtype = torch.half).flatten(-2)
         conv_out, conv_stream = self._short_conv(normed, conv_state)
         delta = gated + conv_out.view(bsz, seq, H, D)
@@ -442,6 +616,8 @@ class PLELayer(Module):
             # what HF's would hold as well)
             ids = ids.clone()
             ids[ids >= FIRST_MM_EMBEDDING_INDEX] = self.mm_token_id
+        if self.token_map is not None:
+            ids = self.token_map[ids]
         return ids
 
     def _history(self, ids: torch.Tensor) -> torch.Tensor:
@@ -453,6 +629,23 @@ class PLELayer(Module):
         """History for a forward with recurrent states in params: the carried context comes from
         the state slots. Returns (history, layer state, slots), or (history, None, None) for a
         stateless forward at position 0."""
+        if self.stateless:
+            # The caller hands over the raw ids before the input (up to the context length, -1 where the
+            # sequence has none); mapped like the input, missing ones read as the pad id
+            prev = params.get("prev_ids")
+            if prev is None:
+                seqlens = params.get("cache_seqlens")
+                assert params.get("position", 0) == 0 and (seqlens is None or not bool(seqlens.any())), \
+                    "PLELayer requires prev_ids for forwards past position 0"
+                return self._history(ids), None, None
+            ctx = self.ple_embedding.context_len
+            prev = prev.to("cpu", torch.int64)[:, -ctx:]
+            assert prev.shape[0] == ids.shape[0]
+            if prev.shape[1] < ctx:
+                prev = torch.nn.functional.pad(prev, (ctx - prev.shape[1], 0), value = -1)
+            mapped = self._prepare_ids(prev.clamp_min(0))
+            mapped = torch.where(prev < 0, mapped.new_full((), self.ple_embedding.eos_token_id), mapped)
+            return torch.cat((mapped, ids), dim = 1), None, None
         rsg = params.get("recurrent_states")
         if rsg:
             layer_instance = (self.layer_idx, params.get("layer_instance", 0))
@@ -462,7 +655,12 @@ class PLELayer(Module):
             else:
                 rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
             _, id_state = rsl.get_state_tensors()
-            slots = get_for_device(params, "recurrent_slots", "cpu").tolist()
+            # Models whose other layers address their states through the state objects (DSV4) carry no
+            # recurrent_slots tensor; the slots come from the states themselves
+            if "recurrent_slots" in params:
+                slots = get_for_device(params, "recurrent_slots", "cpu").tolist()
+            else:
+                slots = [rs.slot for rs in rsg[:ids.shape[0]]]
             assert len(slots) == ids.shape[0]
             ctx = self.ple_embedding.context_len
             prev_ids = torch.stack([id_state[s, :ctx] for s in slots])
@@ -483,6 +681,13 @@ class PLELayer(Module):
         self.ple_embedding.prefetch(history)
 
     @override
+    def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        # A deferred mHC apply lands before its streams move to another device (as TransformerBlock)
+        if "hc_pending" in params and x.device != self.device:
+            hc_flush(params)
+        return super().prepare_for_device(x, params)
+
+    @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
         """
         Standalone-module form: x is the (bsz, seq, hc_mult, hidden) stream stack; token ids come
@@ -498,12 +703,22 @@ class PLELayer(Module):
             out = x.clone()
             self.tp_collect(params["backend"], out, False)
             return out
+        # A deferred mHC apply on the incoming streams lands first
+        hc_flush(params)
         bsz, seq = x.shape[:2]
         ids = params.get("input_ids")
         if ids is None:
             # autosplit measuring forward: no token ids in params; a dummy history gives the
             # same memory profile (the real n-gram gather is a few hundred rows at most)
             ids = torch.zeros((bsz, seq), dtype = torch.long)
+        params.pop("ple_keep_rows", None)
+        if self.mm_gate_off and self.mm_token_id is not None and int(ids.max()) >= FIRST_MM_EMBEDDING_INDEX:
+            # Rows inside an image span: hashed as the placeholder (context for the text after them) but
+            # left untouched themselves
+            params["ple_keep_rows"] = (ids < FIRST_MM_EMBEDDING_INDEX).to(x.device, torch.float)
+        if self.off_token_id is not None and bool((ids == self.off_token_id).any()):
+            keep = (ids != self.off_token_id).to(x.device, torch.float)
+            params["ple_keep_rows"] = keep * params["ple_keep_rows"] if "ple_keep_rows" in params else keep
         ids = self._prepare_ids(ids)
         ctx = self.ple_embedding.context_len
         win = self.conv_state_len
@@ -512,19 +727,24 @@ class PLELayer(Module):
         history, rsl, slots = self._state_history(ids, params)
         if rsl is not None:
             conv_state, id_state = rsl.get_state_tensors()
-            cs = torch.stack([conv_state[s, :, :win] for s in slots]).to(x.device)
+            cs = torch.stack([conv_state[s, :, :win] for s in slots]).to(x.device) if win else None
             delta, conv_stream = self.forward_streams(x, history, params, conv_state = cs)
             for i, s in enumerate(slots):
                 if save_history:
-                    w = min(conv_state.shape[-1], conv_stream.shape[-1])
-                    conv_state[s, :, -w:].copy_(conv_stream[i, :, -w:])
+                    if conv_stream is not None:
+                        w = min(conv_state.shape[-1], conv_stream.shape[-1])
+                        conv_state[s, :, -w:].copy_(conv_stream[i, :, -w:])
                     wi = min(id_state.shape[-1], history.shape[-1])
                     id_state[s, -wi:].copy_(history[i, -wi:])
                 else:
-                    conv_state[s, :, :win].copy_(conv_stream[i, :, -win:])
+                    if conv_stream is not None:
+                        conv_state[s, :, :win].copy_(conv_stream[i, :, -win:])
                     id_state[s, :ctx].copy_(history[i, -ctx:])
         else:
             delta, _ = self.forward_streams(x, history, params)
+        keep = params.pop("ple_keep_rows", None)
+        if delta is not None and keep is not None:
+            delta = delta * keep[:, :, None, None]
         out = x if delta is None else x + delta
         if self.tp_owner is not None:
             self.tp_collect(params["backend"], out)

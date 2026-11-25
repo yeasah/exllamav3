@@ -93,8 +93,7 @@ def _dsa_attn_kernel(
     DEBUG_PAGES: tl.constexpr = 0,
     NC_BLOCK: tl.constexpr = 0,    # DSpark draft mode: every row sees the SAME range
                                    # [win_floor, q_pos0 + R) (window history ++ whole
-                                   # chunk, non-causal); history rows are PAGED, read
-                                   # via block_table at absolute-position pages
+                                   # chunk, non-causal); history rows come from the ring
     NC_CHUNK: tl.constexpr = 0,    # non-causal image chunk (DeepSeek-V4 vision): every
                                    # row sees the WHOLE chunk plus its own causal window
                                    # of NC_HIST history rows from the ring; win_len is
@@ -173,13 +172,7 @@ def _dsa_attn_kernel(
             mc = in_range & (abs_pos >= q_pos0)
             mr = in_range & (abs_pos < q_pos0)
             idx_c = tl.where(mc, abs_pos - q_pos0, 0)
-            if NC_BLOCK:
-                ap = tl.where(mr, abs_pos, 0)
-                w_phys = tl.load(block_table + row * num_pages_per_row + ap // page_size,
-                                 mask = mr, other = 0)
-                idx_r = w_phys * page_size + ap % page_size
-            else:
-                idx_r = tl.where(mr, abs_pos - ring_beg, 0)
+            idx_r = tl.where(mr, abs_pos - ring_beg, 0)
             vc = tl.load(kv_chunk + idx_c[:, None] * D + offs_c[None, :],
                          mask = mc[:, None] & valid_c[None, :], other = 0.0) \
                + tl.load(ring + idx_r[:, None] * D + offs_c[None, :],
@@ -608,7 +601,7 @@ def _dsa_indexer_kernel(
     q_idx,               # (R, H_i, D_i) fp16, rope applied
     w,                   # (R, H_i) fp16 raw head weights (scales folded into `scale`)
     k_idx,               # (T, D_i) fp16 indexer keys, rope applied; paged when EPP > 0
-    scores,              # (R, S_stride) fp16 out
+    scores,              # (R, S_stride) fp16 or fp32 out (the accumulation is fp32 either way)
     T,                   # runtime: valid keys
     R,                   # runtime: valid query rows
     q_pos0,              # runtime: absolute position of query row 0
@@ -659,7 +652,7 @@ def _dsa_indexer_kernel(
     acc = acc * scale
     bound = tl.minimum((q_pos0 + offs_m + 1) // compress_rate, bound_max)
     acc = tl.where(offs_n[None, :] < bound[:, None], acc, -float("inf"))
-    tl.store(scores + offs_m[:, None] * S_stride + offs_n[None, :], acc.to(tl.float16),
+    tl.store(scores + offs_m[:, None].to(tl.int64) * S_stride + offs_n[None, :], acc.to(scores.dtype.element_ty),
              mask = valid_m[:, None] & valid_n[None, :])
 
 
@@ -669,7 +662,7 @@ def _dsa_indexer_fewq_kernel(
     q_idx,               # (R, H_i, D_i) fp16, rope applied
     w,                   # (R, H_i) fp16 raw head weights
     k_idx,               # (T, D_i) fp16 indexer keys, rope applied; paged when EPP > 0
-    scores,              # (R, S_stride) fp16 out
+    scores,              # (R, S_stride) fp16 or fp32 out (the accumulation is fp32 either way)
     T,
     R,
     q_pos0,
@@ -731,7 +724,7 @@ def _dsa_indexer_fewq_kernel(
 
     bound = tl.minimum((q_pos0 + loc + 1) // compress_rate, bound_max)
     acc = tl.where(offs_n < bound, acc, -float("inf"))
-    tl.store(scores + r * S_stride + offs_n, acc.to(tl.float16), mask = valid_n)
+    tl.store(scores + r * S_stride + offs_n, acc.to(scores.dtype.element_ty), mask = valid_n)
 
 
 @triton.jit(do_not_specialize = ["num_pages_per_row", "append_len"])
@@ -904,8 +897,8 @@ def dsa_attn(
     num_stages = 3,
     page_size = 256,         # pool entries per block-table page (PAGE_SIZE // m for the
                              # paged pools; 256 with an identity table for contiguous pools)
-    nc_block = False,        # DSpark draft mode: non-causal chunk + paged window history
-                             # (single job per call; forces the one-shot kernel)
+    nc_block = False,        # DSpark draft mode: non-causal chunk + window history from the
+                             # ring (single job per call; forces the one-shot kernel)
     nc_chunk = False,        # non-causal image chunk (DeepSeek-V4 vision): every query sees
                              # the whole chunk (bidirectional) plus its own win_len-wide
                              # causal window into the ring history; pool phases unchanged
@@ -932,7 +925,7 @@ def dsa_attn(
     q_split = q_pe is not None
     if q_split:
         # Split absorbed queries exclude every feature that would touch the packed layout
-        assert not (win_len and kv_chunk is not None) and sinks is None and \
+        assert not (win_len and kv_chunk is not None) and \
             derot_inv_freq is None and groups == 1 and not group_major and \
             multirow is None and not nc_block and out_latent
         H, R, D_c = q.shape
@@ -1188,8 +1181,9 @@ def dsa_indexer_scores(
     epp = 0,                 # pool entries per page (paged mode)
     scale = None,            # None: D_i ** -0.5 * H_i ** -0.5 (DSA); QSA passes dk ** -0.5
 ):
-    """Indexer scores (R, T) fp16 with -inf past each query's causal entry bound
-    min((q_pos0 + r + 1) // compress_rate, bound_max); feed to topk."""
+    """Indexer scores (R, T) with -inf past each query's causal entry bound
+    min((q_pos0 + r + 1) // compress_rate, bound_max); feed to topk. fp16 unless the caller
+    hands in an fp32 backing, which keeps the scores unrounded (ext.dsa_topk takes either)."""
     R, H_i, D_i = q_idx.shape
     if scale is None:
         scale = D_i ** -0.5 * H_i ** -0.5

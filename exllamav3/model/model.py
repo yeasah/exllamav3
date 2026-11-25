@@ -31,6 +31,9 @@ class Model(Model_TPMixin, Model_LSMixin):
         self.cache_weakrefs = {}
         self.recurrent_state_cls = None
         self.draft_verifier_params = {}
+        # Set by a Generator running prefill across the split (PrefillPipeline); a direct forward or
+        # prefill waits for what it has issued
+        self.pipeline = None
 
         # Index of last layer that affects KV cache, used during prefill
         self.last_kv_module_idx = None
@@ -267,6 +270,8 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         vocab = self.config.vocab_size
         recurrent = len(self.get_recurrent_layers()) > 0
+        # Models that hash each token with the ids before it (caps "prev_ids") take those from the caller
+        n_prev = self.caps.get("prev_ids", 0)
         rng = random.Random(0)
         def ids(b, n):
             return torch.tensor([[rng.randrange(vocab) for _ in range(n)] for _ in range(b)], dtype = torch.long)
@@ -312,6 +317,7 @@ class Model(Model_TPMixin, Model_LSMixin):
             for label, bsz, seq_cap, steps in families:
                 states = None
                 pos = 0
+                prev = torch.full((bsz, n_prev), -1, dtype = torch.long)
                 # Take the family's recurrent-state slots up front (all or nothing) so a shortage
                 # never strands a slot: prepare_for_recurrence creates them one by one and would
                 # leak the ones it took before running out
@@ -344,10 +350,15 @@ class Model(Model_TPMixin, Model_LSMixin):
                     if q > 16:
                         params["last_tokens_only"] = 1
                     step_label = f"{label}, {q} token(s) at {pos}" if cache is not None else label
+                    step_ids = ids(bsz, q)
+                    if n_prev:
+                        params["prev_ids"] = prev
                     try:
-                        self.forward(ids(bsz, q), params)
+                        self.forward(step_ids, params)
                         states = params.get("recurrent_states")
                         pos += q
+                        if n_prev:
+                            prev = torch.cat((prev, step_ids), dim = 1)[:, -n_prev:]
                     except Exception as e:
                         failures.append(step_label)
                         print(f" !! Warmup pass failed ({step_label}): {e!r}")
@@ -376,6 +387,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         """
         if params is None:
             params = {}
+        if self.pipeline is not None:
+            self.pipeline.flush()
         x = self.prepare_inputs(input_ids, params)
         if self.loaded_tp:
             y = self.prefill_tp(x, params, self.last_kv_module_idx, self.modules)
@@ -407,8 +420,24 @@ class Model(Model_TPMixin, Model_LSMixin):
                 params["draft_conf"] = conf
             return ids
         lm = self.modules[self.logit_layer_idx]
+        # Draft-only sparse subset of the vocabulary, selected by the caller through params so the
+        # verification forward can never take it
+        sh = lm.sparse_head
+        flag = params.get("sparse_head") if sh is not None else None
+        if flag is True and sh.ready:
+            ids, conf, emb = sh.argmax(lm.prepare_for_device(state, params), embedding = True)
+            if export:
+                params["draft_conf"] = conf
+            if emb is not None:
+                params["draft_embedding"] = emb
+            return ids
         logits = lm.forward(lm.prepare_for_device(state, params), params)
         logits = logits[..., :self.config.vocab_size]
+        if flag == "probe":
+            # Probe round: full head answers, the sparse pick is recorded alongside for the drift statistics
+            full_ids = torch.argmax(logits, dim = -1)
+            sparse_ids, _ = sh.argmax(lm.prepare_for_device(state, params))
+            sh.record_probe(full_ids, sparse_ids)
         if export:
             conf, ids = torch.max(logits, dim = -1)
             params["draft_conf"] = conf
@@ -428,6 +457,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         """
         if params is None:
             params = {}
+        if self.pipeline is not None:
+            self.pipeline.flush()
         x = self.prepare_inputs(input_ids, params)
         if self.loaded_tp:
             y = self.forward_tp(x, params, self.last_kv_module_idx, self.modules)
@@ -442,6 +473,8 @@ class Model(Model_TPMixin, Model_LSMixin):
 
 
     def unload(self):
+        if self.pipeline is not None:
+            self.pipeline.flush()
         for module in self.modules:
             module.unload()
         # The loader's open slab blocks must not outlive the tensors sliced from them
@@ -475,6 +508,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         max_batch_size: int = 1,
         tp_options: dict | None = None,
         autosplit_no_forward: bool = False,
+        draft_model: Model | None = None,
+        attn_device: torch.device | str | int | None = None,
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -564,7 +599,36 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         :param autosplit_no_forward:
             For debug purposes, skip reference forward pass during autosplit load.
+
+        :param draft_model:
+            (optional) Draft model that will verify against this model. Loaded first, except when its caps say
+            load_with_target: such a drafter (the Gemma4 assistant) reads this model's cache layers in place and
+            cannot load on its own; its modules are loaded here, each on the device of the layer it reads (see
+            its modules_with_target), within the same budget. In a tensor-parallel load it goes on the output
+            device, and the layers it reads (its target_source_keys) run whole there instead of being split,
+            since the other devices' shares would be out of its reach. When the drafter taps hidden states of
+            this model (DFlash), the copies of the tapped layers' states stay resident on their devices for the
+            whole forward, and the split budgets for them.
+
+        :param attn_device:
+            (optional, split load) Device for the modules the architecture pins together (caps["attn_device"]:
+            the attention layers of DeepSeek-V4.1, whose layers read K/V pools and index selections owned by
+            earlier layers, so a layer split cannot place them per layer). They load there first, every other
+            module splits over the remaining budget, and a block whose attention sits elsewhere moves the
+            attention input and output across. Default: the first device of the split
         """
+
+        if self.caps.get("load_with_target"):
+            raise RuntimeError(
+                f"{self.config.architecture} loads with its target model: pass it as draft_model to the target's "
+                f"load() instead of loading it on its own"
+            )
+        attached = None
+        with_draft = draft_model is not None and draft_model.caps.get("load_with_target")
+        if with_draft:
+            draft_model.attach_to(self)
+            if not tensor_p:
+                attached = draft_model.modules_with_target(self)
 
         # The pass is there to hand back VRAM held by garbage from an earlier model. With nothing
         # allocated on any device yet (the usual first load) there is none, and a full collection
@@ -584,6 +648,16 @@ class Model(Model_TPMixin, Model_LSMixin):
             # shares the config but loads after the main model's worker has already started)
             self.config.infer_params.moe_cpu_component = getattr(self, "component", "text")
 
+            # CPU-offloaded experts: start the worker process now, so its own startup (the
+            # interpreter, torch, the checkpoint index) overlaps the first modules' loading
+            # instead of holding up the first offloaded layer. It idles if no layer ends up
+            # offloaded; unload shuts it down either way
+            from ..modules.block_sparse_mlp_cpu import cpu_budget
+            cpu_layers, cpu_split = cpu_budget(self.config.infer_params)
+            if cpu_layers or cpu_split:
+                from .moe_cpu_host import MoeCpuHost
+                MoeCpuHost.for_config(self.config)._spawn()
+
             assert not (bool(reserve_per_device) and bool(use_per_device)), \
                 "Cannot specify both memory usage and memory reserve."
 
@@ -597,7 +671,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                     "Cannot specify reserve_per_device or use_per_device when loading to single device."
                 assert not tensor_p, \
                     "Cannot use tensor_p when loading to single device."
-                self._load_single(progressbar, device, self.config, self.modules, verbose)
+                self._load_single(progressbar, device, self.config, self.modules, verbose, attached)
                 self.output_device = self.modules[-1].device
 
             # Use/reserve
@@ -652,6 +726,9 @@ class Model(Model_TPMixin, Model_LSMixin):
                         max_batch_size,
                         self.cache_weakrefs,
                         autosplit_no_forward,
+                        draft_model.draft_verifier_params.get("export_state_layers") if draft_model else None,
+                        attached,
+                        attn_device,
                     )
                     self.output_device = self.modules[-1].device
 
@@ -665,12 +742,9 @@ class Model(Model_TPMixin, Model_LSMixin):
                     # stages modules on the CPU and the workers rebuild them from the export, so a
                     # requested offload would be dropped without notice and every expert would land
                     # in VRAM
-                    ip = self.config.infer_params
                     cpu_modes = [name for name, value in (
-                        ("moe_cpu_split", getattr(ip, "moe_cpu_split", 0)),
-                        ("moe_cpu_offload", getattr(ip, "moe_cpu_offload", 0)
-                            if getattr(self, "component", "text") == "text"
-                            else getattr(ip, "draft_moe_cpu_offload", 0)),
+                        ("moe_cpu_split", cpu_split),
+                        ("moe_cpu_offload", cpu_layers),
                     ) if value]
                     if cpu_modes:
                         raise NotImplementedError(
@@ -704,8 +778,13 @@ class Model(Model_TPMixin, Model_LSMixin):
                         tp_backend,
                         verbose,
                         tp_options,
+                        draft_model.modules if with_draft else None,
+                        draft_model.target_source_keys() if with_draft else None,
                     )
                     self.output_device = tp_output_device
+                    # The drafter binds to the output device's shards, which exist now
+                    if with_draft:
+                        draft_model.attach_to(self)
 
             free_mem()
 
@@ -713,13 +792,21 @@ class Model(Model_TPMixin, Model_LSMixin):
             g_tensor_cache.drop_all()
 
             # Mark every attached cache usable.
-            for ref in self.cache_weakrefs.values():
-                cache = ref()
-                if cache is not None:
-                    cache.initialized = True
+            self._mark_caches_initialized()
+            # A drafter loaded alongside: finished the way its own load would have
+            if with_draft:
+                draft_model.output_device = draft_model.modules[-1].device
+                draft_model._mark_caches_initialized()
         finally:
             if freeze:
                 gc.unfreeze()
+
+
+    def _mark_caches_initialized(self):
+        for ref in self.cache_weakrefs.values():
+            cache = ref()
+            if cache is not None:
+                cache.initialized = True
 
 
     @torch.inference_mode

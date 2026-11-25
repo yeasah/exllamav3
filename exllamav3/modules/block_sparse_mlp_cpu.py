@@ -1,5 +1,4 @@
 from __future__ import annotations
-from typing_extensions import override
 import os
 import torch
 from ..ext import exllamav3_ext as ext
@@ -86,30 +85,33 @@ def save_expert_stats(infer_params):
     reg = getattr(infer_params, "moe_cpu_swap_modules", None)
     if not reg or reg[0]._split_step_count < _STATS_MIN_STEPS:
         return
-    config, E = reg[0].config, reg[0].num_experts
-    layers = _expert_stats_load(config, E)
+    config = reg[0].config
+    # The profiles are per expert count, which a draft component sharing the config needn't share
+    by_count = {}
     for m in reg:
         if m._split_hist is None or getattr(m, "tid2eid_key", None):
             continue
         hist = m._split_hist.tolist()
-        if m.num_experts != E or sum(hist) <= 0.0:
+        if sum(hist) <= 0.0:
             continue
+        E = m.num_experts
         perm = m._split_perm or list(range(E))
         counts = [0.0] * E
         for r, c in enumerate(hist):
             counts[perm[r]] = c
-        layers[m.key] = counts
-    if not layers:
-        return
-    path = _expert_stats_path(config, E)
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok = True)
-        fd, tmp = tempfile.mkstemp(dir = os.path.dirname(path), suffix = ".tmp")
-        with os.fdopen(fd, "w") as f:
-            json.dump({"model_dir": os.path.abspath(config.directory), "layers": layers}, f)
-        os.replace(tmp, path)
-    except OSError as e:
-        print(f" !! expert stats not saved ({path}): {e}")
+        by_count.setdefault(E, {})[m.key] = counts
+    for E, counted in by_count.items():
+        layers = _expert_stats_load(config, E)
+        layers.update(counted)
+        path = _expert_stats_path(config, E)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok = True)
+            fd, tmp = tempfile.mkstemp(dir = os.path.dirname(path), suffix = ".tmp")
+            with os.fdopen(fd, "w") as f:
+                json.dump({"model_dir": os.path.abspath(config.directory), "layers": layers}, f)
+            os.replace(tmp, path)
+        except OSError as e:
+            print(f" !! expert stats not saved ({path}): {e}")
 
 
 @torch.inference_mode()
@@ -151,9 +153,40 @@ def run_pending_swap_sweeps(infer_params):
         print(f" -- expert swap sweep: {total} swaps", flush = True)
 
 
+def register_split_module(infer_params, module):
+    """Add a split module to the config's dynamic-placement registry. Its first entry drives the per-step hooks
+    (_split_swap_tick), so a draft component sharing the config (an MTP head: loads first, drafts N times) goes last"""
+    reg = getattr(infer_params, "moe_cpu_swap_modules", None)
+    if reg is None:
+        reg = []
+        infer_params.moe_cpu_swap_modules = reg
+        # A server killed with Ctrl-C never reaches unload: save what the session
+        # learned at interpreter exit as well (a no-op after a normal unload, which
+        # empties the registry; best effort, the CUDA tensors may already be gone)
+        import atexit, weakref
+        ref = weakref.ref(infer_params)
+        def _save_at_exit():
+            ip = ref()
+            if ip is None:
+                return
+            try:
+                save_expert_stats(ip)
+            except Exception:
+                pass
+        atexit.register(_save_at_exit)
+    reg.append(module)
+    reg.sort(key = lambda m: m.cpu_component != "text")
+
+
 _STATS_SAVE_INTERVAL = 4096   # decode steps between writes of the expert frequency profile
 _STATS_MIN_STEPS = 64         # decode steps a session needs before its profile is worth keeping
-_PROMOTE_BUDGET = 6         # promotions issued per step over all layers (and as many demotions)
+# The GPU is driven through WDDM: Windows, or WSL2 (whose GPU paravirtualization shows up as /dev/dxg)
+_WDDM = os.name == "nt" or os.path.exists("/dev/dxg")
+# Promotions issued per step over all layers (and as many demotions), EXL3_MOE_CPU_PROMOTE_BUDGET. A transfer costs
+# host time and copies on the promotion stream, and pays off in worker experts later steps no longer route, so the
+# best value grows with the cost of a worker expert. Lower under WDDM, which runs streams in submission order: each
+# transfer's copies queue ahead of the next draft forward
+_PROMOTE_BUDGET = max(0, int(os.environ.get("EXL3_MOE_CPU_PROMOTE_BUDGET", 3 if _WDDM else 6)))
 _PROMOTE_RATIO = 1.5        # a miss is promoted when its decayed count is this many times the victim's
 _PROMOTE_DECAY = 0.98       # per-step decay of the hit counts
 
@@ -161,11 +194,16 @@ _PROMOTE_DECAY = 0.98       # per-step decay of the hit counts
 class _PromoteState:
     """Promote-on-miss bookkeeping over every split module with spares, as [modules, experts] host
     tensors so one step is a few vector ops: the hit-count snapshots (pinned, one device-to-host copy
-    per module per step, one event per device), the previous snapshot, the placement map mirror and
-    the in-flight mask. Per module, the free slot lists and the transfers in flight stay Python lists"""
+    and one event per device per step), the previous snapshot, the placement map mirror and the
+    in-flight mask. Per module, the free slot lists and the transfers in flight stay Python lists"""
 
     def __init__(self, modules):
-        self.modules = [m for m in modules if m._split_spares and m._split_pending is not None]
+        self.head = modules[0]
+        # Grouped by device, so each device's modules are one contiguous block of rows
+        self.modules = sorted(
+            (m for m in modules if m._split_spares and m._split_pending is not None),
+            key = lambda m: torch.device(m.device).index or 0
+        )
         n = len(self.modules)
         e = max(m.num_experts for m in self.modules)
         import numpy as np
@@ -183,33 +221,53 @@ class _PromoteState:
         self.devices = sorted({torch.device(m.device).index or 0 for m in self.modules})
         self.snap_ev = {}
         self.stats = dict(routed = 0, missed = 0, steps = 0, ms = 0.0)
+        # Per device, the modules' hit counts become row views of one [rows, experts] tensor (the
+        # issue kernels keep writing them in place), so the snapshot and the decay are one call each
+        self.hists = {}
+        for d in self.devices:
+            rows = [i for i, m in enumerate(self.modules) if (torch.device(m.device).index or 0) == d]
+            a, b = rows[0], rows[-1] + 1
+            hist = torch.zeros((b - a, e), dtype = torch.float, device = self.modules[a]._split_hist.device)
+            for i in rows:
+                m = self.modules[i]
+                hist[i - a, :m.num_experts].copy_(m._split_hist)
+                m._split_hist = hist[i - a, :m.num_experts]
+            self.hists[d] = (a, b, hist)
         for m in self.modules:
             m._split_snap = None          # the per-module snapshot is superseded by the shared one
+        # Landed map updates: (router id, slot) pairs staged in pinned memory and uploaded with one non-blocking copy
+        # per device (a pageable copy would wait for the queued pass). A (module, expert) lands at most once per pass,
+        # so n * e pairs always fit; land_ev keeps the staging until the previous upload has run
+        self.land = torch.empty((n * e, 2), dtype = torch.long).pin_memory()
+        self.land_np = self.land.numpy()
+        self.land_ev = []
+        self.decide_rows = None           # rows of the pass awaiting its decide (see promote_tick)
 
 
-def _split_promote_step(ip, modules, rows):
-    """One decode step of promote-on-miss for every split module (called from the first module's
-    submit, before any layer's selection translate of this step).
+def promote_tick(ip):
+    """Promote-on-miss decide for the last pass. The generator calls this once a verify pass is queued, so the host
+    work overlaps the GPU's; a pass nobody ticks (prefill, a driver without a generator) is decided at the start of
+    the next pass, ahead of its landing"""
+    ps = getattr(ip, "moe_cpu_promote_state", None)
+    if ps is None or ps.decide_rows is None:
+        return
+    rows, ps.decide_rows = ps.decide_rows, None
+    _split_promote_decide(ps, rows)
 
-    (1) Transfers that landed take effect in the map, on the compute stream ahead of this step's
-    translate kernels; the slot they vacated is free from this step on, since nothing maps to it any
-    more. (2) The previous step's hit counts (snapshotted to pinned memory) name the routed experts;
-    those the worker computed are the misses. (3) The misses, ranked by count over all layers, take
-    free GPU slots of their layer when their count clears the layer's least-used unrouted resident's
-    by _PROMOTE_RATIO, up to _PROMOTE_BUDGET per step: the block is copied from the arena on the
-    promotion stream, ordered after everything the compute stream had enqueued (the slot's last
-    reader was a previous step). (4) The worker slots promotions freed take the least-used unrouted
-    residents, copied out on the promotion stream; the map flips once the copy has landed. Every
-    transfer leaves the expert live where it was until its copy is complete, so a route always finds
-    valid weights. Nothing is issued on a prefill-size step (its stager reads worker slots)."""
+
+def _split_promote_land(ip, modules):
+    """(1) of the promote-on-miss step for every split module (called from the first module's submit, before any
+    layer's selection translate of the pass). Transfers that landed take effect in the map, on the compute stream
+    ahead of this pass's translate kernels; the slot they vacated is free from this pass on, since nothing maps to it
+    any more. Returns the step state"""
     import time
     t0 = time.perf_counter()
     ps = getattr(ip, "moe_cpu_promote_state", None)
-    if ps is None or ps.modules[0] is not modules[0]:
+    if ps is None or ps.head is not modules[0]:
         ps = ip.moe_cpu_promote_state = _PromoteState(modules)
     verify = os.environ.get("EXL3_MOE_CPU_PROMOTE_VERIFY")
-    debug = os.environ.get("EXL3_MOE_CPU_SWAP_DEBUG")
-    # (1) landed transfers
+    n = 0
+    uploads = {}                          # device -> [(module, first pair, end pair)], contiguous per device
     for i, m in enumerate(ps.modules):
         if not m._split_pending:
             continue
@@ -235,10 +293,43 @@ def _split_promote_step(ip, modules, rows):
         m._split_pending = keep
         if idx:
             ps.mp[i, idx] = val
-            dev = torch.device(m.device)
-            with torch.cuda.device(dev):
-                m._split_map[torch.tensor(idx, device = dev)] = torch.tensor(val, device = dev)
-    # (2) last step's routes: the snapshots land, the next ones go out
+            if n == 0:
+                for ev in ps.land_ev:
+                    ev.synchronize()
+            ps.land_np[n:n + len(idx), 0] = idx
+            ps.land_np[n:n + len(idx), 1] = val
+            uploads.setdefault(torch.device(m.device), []).append((m, n, n + len(idx)))
+            n += len(idx)
+    if uploads:
+        ps.land_ev = []
+    for dev, parts in uploads.items():
+        a, b = parts[0][1], parts[-1][2]
+        with torch.cuda.device(dev):
+            up = ps.land[a:b].to(dev, non_blocking = True)
+            for m, ma, mb in parts:
+                m._split_map.index_copy_(0, up[ma - a:mb - a, 0], up[ma - a:mb - a, 1])
+            ev = torch.cuda.Event()
+            ev.record(torch.cuda.current_stream(dev))
+            ps.land_ev.append(ev)
+    if os.environ.get("EXL3_MOE_CPU_SWAP_DEBUG"):
+        ps.stats["ms"] += time.perf_counter() - t0
+    return ps
+
+
+def _split_promote_decide(ps, rows):
+    """(2)-(4) of the promote-on-miss step, once per pass after its launches (promote_tick). (2) The previous
+    pass's hit counts (snapshotted to pinned memory) name the routed experts; those the worker computed are the
+    misses. (3) The misses, ranked by count over all layers, take free GPU slots of their layer when their count
+    clears the layer's least-used unrouted resident's by _PROMOTE_RATIO, up to _PROMOTE_BUDGET per pass: the block is
+    copied from the arena on the promotion stream, ordered after everything the compute stream had enqueued (the
+    slot's last reader was a previous pass). (4) The worker slots promotions freed take the least-used unrouted
+    residents, copied out on the promotion stream; the map flips once the copy has landed (_split_promote_land).
+    Every transfer leaves the expert live where it was until its copy is complete, so a route always finds valid
+    weights. Nothing is issued after a prefill-size pass (its stager reads worker slots)."""
+    import time
+    t0 = time.perf_counter()
+    debug = os.environ.get("EXL3_MOE_CPU_SWAP_DEBUG")
+    # (2) last pass's routes: the snapshots land, the next ones go out
     have = bool(ps.snap_ev)
     for ev in ps.snap_ev.values():
         ev.synchronize()
@@ -246,16 +337,13 @@ def _split_promote_step(ip, modules, rows):
         cur = ps.snap_np.copy()
         routed = cur > ps.prev
         ps.prev = cur
-    for i, m in enumerate(ps.modules):
-        dev = torch.device(m.device)
-        with torch.cuda.device(dev):
-            ps.snap[i, :m.num_experts].copy_(m._split_hist, non_blocking = True)
-    for d in ps.devices:
-        ev = torch.cuda.Event()
-        ev.record(torch.cuda.current_stream(d))
-        ps.snap_ev[d] = ev
-    hists = [m._split_hist for m in ps.modules]
-    torch._foreach_mul_(hists, _PROMOTE_DECAY)
+    for d, (a, b, hist) in ps.hists.items():
+        with torch.cuda.device(d):
+            ps.snap[a:b].copy_(hist, non_blocking = True)
+            ev = torch.cuda.Event()
+            ev.record(torch.cuda.current_stream(d))
+            ps.snap_ev[d] = ev
+            hist.mul_(_PROMOTE_DECAY)
     if have and rows < ps.modules[0].cpu_host.stream_min_rows:
         import numpy as np
         resident = ps.mp < ps.first
@@ -317,11 +405,11 @@ def _split_promote_step(ip, modules, rows):
         st = ps.stats
         st["steps"] += 1
         st["ms"] += time.perf_counter() - t0
-        if modules[0]._split_step_count % 128 == 0:
+        if ps.head._split_step_count % 128 == 0:
             p = sum(m._split_promo_n for m in ps.modules)
             d = sum(m._split_demo_n for m in ps.modules)
             pend = sum(len(m._split_pending) for m in ps.modules)
-            print(f" -- promote-on-miss: step {modules[0]._split_step_count}, {p} promotions, {d} demotions, {pend} in flight; "
+            print(f" -- promote-on-miss: step {ps.head._split_step_count}, {p} promotions, {d} demotions, {pend} in flight; "
                   f"last {st['steps']} steps: {st['routed'] / st['steps']:.1f} routed/step, "
                   f"{st['missed'] / st['steps']:.1f} on the CPU ({100 * (1 - st['missed'] / max(st['routed'], 1)):.1f}% hit), "
                   f"hook {1000 * st['ms'] / st['steps']:.2f} ms/step", flush = True)
@@ -379,6 +467,17 @@ def _split_promote_verify(m, t):
                 f"demote verify failed: {key}.{an} (arena)"
 
 
+def cpu_budget(infer_params) -> tuple[int, int]:
+    """CPU expert budget of the component being loaded (infer_params.moe_cpu_component), as (whole layers, tail
+    experts per layer): the main model's own settings, or the draft ones for any other component sharing the config
+    (an MTP head), which may have a different number of experts per layer"""
+    draft = getattr(infer_params, "moe_cpu_component", "text") != "text"
+    return (
+        int(getattr(infer_params, "draft_moe_cpu_offload" if draft else "moe_cpu_offload", 0) or 0),
+        int(getattr(infer_params, "draft_moe_cpu_split" if draft else "moe_cpu_split", 0) or 0),
+    )
+
+
 def trellis_rate(tile_width: int):
     """Bitrate of an EXL3 trellis from its tile width (last dim): an integer 1..8 for 16 * K, a
     half-integer 1.5 / 2.5 / 3.5 for 16 * K + 8, None for anything the CPU kernels don't take"""
@@ -388,6 +487,10 @@ def trellis_rate(tile_width: int):
     if rem == 8 and 1 <= K <= 3:
         return K + 0.5
     return None
+
+
+_EXCLUSIVE = "moe_cpu_split and moe_cpu_offload are mutually exclusive within a component: the split offloads a " \
+    "slice of every eligible layer's experts, whole-layer offload takes entire layers — pick one"
 
 
 class BlockSparseMLP_CPU:
@@ -406,13 +509,8 @@ class BlockSparseMLP_CPU:
         skips its GPU load entirely on True."""
         ip = self.config.infer_params
         comp = getattr(ip, "moe_cpu_component", "text")
-        budget = getattr(ip, "moe_cpu_offload", 0) if comp == "text" \
-            else getattr(ip, "draft_moe_cpu_offload", 0)
-        if budget:
-            assert not getattr(ip, "moe_cpu_split", 0), \
-                "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \
-                "a slice of every eligible layer's experts, whole-layer offload takes entire " \
-                "layers — pick one"
+        budget, split_k = cpu_budget(ip)
+        assert not (budget and split_k), _EXCLUSIVE
         if (
             budget > 0 and
             ip.moe_cpu_offload_assigned.get(comp, 0) < budget and
@@ -432,24 +530,23 @@ class BlockSparseMLP_CPU:
         then loads that slice."""
         ip = self.config.infer_params
         # Registration shrinks the module to its GPU slice, then the normal load below loads
-        # that slice. infer_params.moe_cpu_split is authoritative (the EXL3_MOE_CPU_SPLIT env
-        # is its construction-time default)
-        split_k = int(getattr(ip, "moe_cpu_split", 0))
-        if split_k:
-            assert not getattr(ip, "moe_cpu_offload", 0) and not getattr(ip, "draft_moe_cpu_offload", 0), \
-                "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \
-                "a slice of every eligible layer's experts, whole-layer offload takes entire " \
-                "layers — pick one"
+        # that slice. The component's setting in infer_params is authoritative (the
+        # EXL3_MOE_CPU_SPLIT env is the main model's construction-time default)
+        comp = getattr(ip, "moe_cpu_component", "text")
+        budget, split_k = cpu_budget(ip)
+        assert not (budget and split_k), _EXCLUSIVE
         split_layers = int(os.environ.get("EXL3_MOE_CPU_SPLIT_LAYERS", 0))
         if split_layers and getattr(ip, "moe_cpu_split_assigned", 0) >= split_layers:
             split_k = 0
         # The split keeps at least one expert on the GPU (the module's GPU slice cannot be
         # empty); a larger request is capped rather than silently turning the split off
         if split_k >= self.num_experts > 1:
-            if not getattr(ip, "moe_cpu_split_capped", False):
-                ip.moe_cpu_split_capped = True
-                print(f" !! --moe_cpu_split {split_k} exceeds the {self.num_experts} routed experts per layer, "
-                      f"capped to {self.num_experts - 1} (use --moe_cpu_offload to move whole layers)")
+            capped = getattr(ip, "moe_cpu_split_capped", ())
+            if comp not in capped:
+                ip.moe_cpu_split_capped = (*capped, comp)
+                print(f" !! {self.key}: CPU split of {split_k} experts exceeds the layer's {self.num_experts} "
+                      f"routed experts, capped to {self.num_experts - 1} (whole layers go to the CPU with the "
+                      f"layer offload instead)")
             split_k = self.num_experts - 1
         if (
             0 < split_k < self.num_experts and
@@ -501,31 +598,14 @@ class BlockSparseMLP_CPU:
                 self._split_busy = set()        # router ids with a transfer in flight
                 self._split_promo_n = 0
                 self._split_demo_n = 0
-            ip2 = self.config.infer_params
-            reg = getattr(ip2, "moe_cpu_swap_modules", None)
-            if reg is None:
-                reg = []
-                ip2.moe_cpu_swap_modules = reg
-                # A server killed with Ctrl-C never reaches unload: save what the session
-                # learned at interpreter exit as well (a no-op after a normal unload, which
-                # empties the registry; best effort, the CUDA tensors may already be gone)
-                import atexit, weakref
-                ref = weakref.ref(ip2)
-                def _save_at_exit():
-                    ip = ref()
-                    if ip is None:
-                        return
-                    try:
-                        save_expert_stats(ip)
-                    except Exception:
-                        pass
-                atexit.register(_save_at_exit)
-            reg.append(self)
+            register_split_module(self.config.infer_params, self)
 
     def cpu_unload(self):
         if self.cpu_split_first is not None:
             host = getattr(self, "cpu_host", None)
             if host is not None:
+                # The generator waits on the compute stream only: a pass's transfers can still be running
+                host.promo_drain()
                 host.unregister()
             (self.gates, self.ups, self.downs, self.modules,
              self.num_local_experts, self.routing_first, self.routing_last) = self._split_saved
@@ -534,7 +614,9 @@ class BlockSparseMLP_CPU:
             if self._split_map is not None:
                 reg = getattr(self.config.infer_params, "moe_cpu_swap_modules", None)
                 if reg is not None and self in reg:
-                    if reg[0] is self:
+                    # The first module of a component to go saves, while the registry still holds every component
+                    # (a draft component sharing the config may unload before or after the main model)
+                    if next(m for m in reg if m.cpu_component == self.cpu_component) is self:
                         save_expert_stats(self.config.infer_params)
                     reg.remove(self)
                 self._split_map = None
@@ -652,19 +734,12 @@ class BlockSparseMLP_CPU:
                 else final_hidden_states + cpu_partial.view(shape)
         return final_hidden_states
 
-    @override
-    def can_defer_load(self):
-        # The frequency-permuted expert split reads the router tensors right after load (to
-        # permute them); deferred fills would land after that read and be lost.
-        # infer_params.moe_cpu_split is the authoritative split source (-mcs sets it; the
-        # EXL3_MOE_CPU_SPLIT env is only its construction-time default), same as
-        # cpu_maybe_split_load. Reading the env here left the guard off on the CLI path.
-        if int(getattr(self.config.infer_params, "moe_cpu_split", 0)) > 0 and (
-            os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
-            or os.path.exists(_expert_stats_path(self.config, self.num_experts))
-        ):
-            return False
-        return super().can_defer_load()
+    def cpu_split_permuted(self) -> bool:
+        """True when the split's expert lists were permuted hot-to-cold (a saved profile or an
+        EXL3_MOE_CPU_SPLIT_STATS file). cpu_post_load then permutes the router tensors right
+        after they load, so those must be filled eagerly even inside a deferred-load bracket;
+        the rest of the module (every GPU-resident expert) keeps the batched deferred fill"""
+        return self.cpu_split_first is not None and getattr(self, "_split_perm", None) is not None
 
     def load_cpu_offload(self, device: torch.Device, **kwargs) -> bool:
         """
@@ -738,14 +813,7 @@ class BlockSparseMLP_CPU:
         # model's worker has started, so it gets its own child (which loads only its own
         # layers from the same checkpoint)
         comp = getattr(self.config.infer_params, "moe_cpu_component", "text")
-        hosts = getattr(self.config, "moe_cpu_hosts", None)
-        if hosts is None:
-            hosts = {}
-            self.config.moe_cpu_hosts = hosts
-        host = hosts.get(comp)
-        if host is None:
-            host = MoeCpuHost(self.config)
-            hosts[comp] = host
+        host = MoeCpuHost.for_config(self.config)
         self.cpu_host = host
         self.cpu_component = comp
         def dims_of(l):
@@ -885,14 +953,7 @@ class BlockSparseMLP_CPU:
 
         from ..model.moe_cpu_host import MoeCpuHost
         comp = getattr(self.config.infer_params, "moe_cpu_component", "text")
-        hosts = getattr(self.config, "moe_cpu_hosts", None)
-        if hosts is None:
-            hosts = {}
-            self.config.moe_cpu_hosts = hosts
-        host = hosts.get(comp)
-        if host is None:
-            host = MoeCpuHost(self.config)
-            hosts[comp] = host
+        host = MoeCpuHost.for_config(self.config)
         self.cpu_host = host
         self.cpu_component = comp
 
@@ -970,8 +1031,11 @@ class BlockSparseMLP_CPU:
         if self._split_step_count % _STATS_SAVE_INTERVAL == 0:
             save_expert_stats(ip)
         if self._split_spares:
-            # Promote-on-miss replaces the sweep: one pass over every split module per step
-            _split_promote_step(ip, reg, self._split_submit_rows)
+            # Promote-on-miss replaces the sweep: the landed transfers take effect ahead of this pass's translates,
+            # and the pass is decided once its launches are queued (promote_tick)
+            promote_tick(ip)
+            ps = _split_promote_land(ip, reg)
+            ps.decide_rows = self._split_submit_rows
             return
         interval = int(os.environ.get("EXL3_MOE_CPU_SWAP_INTERVAL", 128))
         if self._swap_tick_count < interval:

@@ -96,7 +96,7 @@ struct BC_Attention
     bool qkv_mcg;
     bool qkv_mul1;
     at::Tensor qkv_size_n, qkv_n_stride, qkv_had_src;   // device int32, per slice
-    at::Tensor qkv_carrier;   // (slices, MAX_R, width) dtype/width carrier for the mgemm C argument
+    at::Tensor qkv_carrier;   // (slices, MAX_R, width) zero-stride dtype/width carrier for the mgemm C argument
     int qkv_num_src = 0;
 
     // Head norms, fused into the RoPE kernel
@@ -178,7 +178,7 @@ struct BC_Attention
         at::Tensor qsa_q4;       // rope view (bsz, q_len, H_i, rotate_dims)
         at::Tensor qsa_kraw;     // (R, D_i) raw keys
         at::Tensor qsa_wts;      // (R, H_i) fp16, filled with 1.0 (uniform head weights)
-        at::Tensor qsa_scores;   // (R, S_max) fp16, -inf filled once
+        at::Tensor qsa_scores;   // (R, S_max) fp32 (fp16 accepted), -inf filled once
         at::Tensor qsa_pool_idx; // (R, KP_pool) i32 selected block ids
         at::Tensor qsa_indices;  // (R, K_pad) i32 expanded token indices
         std::shared_ptr<TritonKernel> k_qsa_stage, k_qsa_raw_append, k_qsa_pool_update,
