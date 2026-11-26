@@ -284,6 +284,29 @@ def test_ngram_gather_concurrent(table_file):
 
 
 @pytest.mark.platform("linux")
+@pytest.mark.skipif(not hasattr(os, "RWF_NOWAIT"), reason = "needs preadv2 RWF_NOWAIT")
+@pytest.mark.parametrize("case", ["scattered_16", "runs_40"])
+def test_ngram_gather_cold_inline(table_file, case):
+    """Decode-sized gathers (<= 64 runs) read on the calling thread with RWF_NOWAIT, which returns at once for
+    rows not in the page cache; those runs must go to the pool and come back whole. The other gather tests read a
+    file they just wrote, so that fallback never runs there: here the file is evicted first, and the eviction is
+    checked (a NOWAIT read of a sampled row fails) before the gather that depends on it"""
+    path, fd, base, row_bytes, _ = table_file
+    uids = scattered(16, 21) if case == "scattered_16" else scattered(40, 22, runs = True)[:60]
+    os.fsync(fd)
+    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    probe = bytearray(row_bytes)
+    try:
+        os.preadv(fd, [probe], base + uids[len(uids) // 2] * row_bytes, os.RWF_NOWAIT)
+        pytest.skip("page cache not evicted on this filesystem; the fallback cannot be forced")
+    except BlockingIOError:
+        pass
+    out = gather(table_file, uids, extra_rows = 2)
+    assert rows_equal(out[: len(uids)], expect_rows(table_file, uids))
+    assert (out[len(uids):] == -1).all(), "rows past U written"
+
+
+@pytest.mark.platform("linux")
 def test_ngram_gather_rejects(table_file):
     _, fd, base, row_bytes, _ = table_file
     u = torch.tensor([ROWS], dtype = torch.int64)                       # one past the last row
