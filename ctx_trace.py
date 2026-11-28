@@ -1,9 +1,14 @@
 import sys, os
 
 import argparse
+import collections
+import concurrent.futures
 import glob
+import hashlib
 import json
 import random
+import threading
+import time
 import zlib
 
 import torch
@@ -42,7 +47,7 @@ Wikipedia row group 0 per language; eval uses openwebtext (end of the dataset), 
 validation, --code_glob source files and Wikipedia row group 1.
 
 Dependencies: exllamav3's eval extras (datasets, pyarrow, huggingface_hub). --backend vllm also
-needs vllm, imported only when selected.
+needs vllm, and --backend openai requests, each imported only when selected.
 """
 
 ANCHORS = {
@@ -630,32 +635,338 @@ class VllmBackend:
 
     def params(self, mode, max_new_tokens, prompt_len, stop_ids, seed):
         from vllm import SamplingParams
-        if mode is not None:
-            src = PROFILE["modes"][mode]
-        elif SAMPLING is not None:
-            src = SAMPLING
-        else:
-            src = {"temperature": 0.8, "min_p": 0.08}             # exllamav3's DefaultSampler
-        kw = {VLLM_KEYS.get(k, k): v for k, v in src.items()}
         room = self.max_len - prompt_len
         assert room > 0, f"prompt of {prompt_len} tokens does not fit max_model_len {self.max_len}"
-        return SamplingParams(**kw, max_tokens = min(max_new_tokens, room), stop_token_ids = stop_ids, seed = seed)
+        return SamplingParams(**sampling_kw(mode), max_tokens = min(max_new_tokens, room), stop_token_ids = stop_ids, seed = seed)
 
     def run(self, requests):
-        """requests: [(input_ids list, SamplingParams)] -> [(response_ids, eos_reason)]"""
+        """requests: [(input_ids list, SamplingParams)] -> [(response_ids, eos_reason, row extras)]"""
         outs = self.llm.generate([{"prompt_token_ids": ids} for ids, _ in requests], [sp for _, sp in requests])
         res = []
         for o, (_, sp) in zip(outs, requests):
             ids, fin = list(o.outputs[0].token_ids), o.outputs[0].finish_reason
             if fin == "stop" and ids and ids[-1] in sp.stop_token_ids:
                 ids = ids[:-1]
-            res.append((ids, "stop_token" if fin == "stop" else "max_new_tokens" if fin == "length" else fin))
+            res.append((ids, "stop_token" if fin == "stop" else "max_new_tokens" if fin == "length" else fin, {}))
         return res
+
+    def provenance(self):
+        return None
+
+def sampling_kw(mode):
+    """The sampling a conversation's mode asks for, under the OpenAI/vLLM parameter names"""
+    if mode is not None:
+        src = PROFILE["modes"][mode]
+    elif SAMPLING is not None:
+        src = SAMPLING
+    else:
+        src = {"temperature": 0.8, "min_p": 0.08}                 # exllamav3's DefaultSampler
+    return {VLLM_KEYS.get(k, k): v for k, v in src.items()}
+
+# --backend openai: an OpenAI-compatible /v1/completions endpoint generates, for a model too large to
+# generate with here -- a vLLM server, or a router such as OpenRouter. Conversations and template rendering
+# stay here, as with vLLM; the endpoint gets the rendered prompt as token ids where it takes them (vLLM
+# with return_token_ids), else as text, and its text answer is retokenized here. Nothing an endpoint says
+# about itself is taken on trust:
+#  - every response must be a raw completion of exactly this prompt: the endpoint's prompt token count must
+#    match, no reasoning may be split out, and its completion token count must match the text returned.
+#    Most of OpenRouter's providers for Qwen3.8-27B (18 of 23 on 2026-11-27) wrap a completions prompt in
+#    their own chat template, which only the prompt count shows.
+#  - each provider is screened before generating for every sampling parameter the run sets to a
+#    non-neutral value: endpoints accept parameters they then ignore. Rows from a provider that was not
+#    screened (an unpinned router choosing another) are refused like any bad response.
+# A failed or refused request is retried; one that still fails fails the run, never drops its row. Good
+# responses are journaled (<output>_api.jsonl), so a rerun pays only for what is missing. The trace header
+# records the endpoint, what it says about the model and its providers, and the screening.
+OPENAI_DEFAULTS = {"api_key_env": "OPENAI_API_KEY", "body": {}, "concurrency": 16, "attempts": 6, "timeout": 900,
+                   "tokens": "auto"}
+OPENAI_SAMPLING = {"temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty"}
+# A parameter at its neutral value changes nothing, so an endpoint ignoring it is harmless and goes untested
+OPENAI_NEUTRAL = {"top_p": [1.0], "top_k": [0, -1], "min_p": [0.0], "presence_penalty": [0.0],
+                  "frequency_penalty": [0.0], "repetition_penalty": [1.0]}
+# Screening: each truncation at its extreme makes sampling greedy, so seeds that otherwise disagree must agree;
+# each penalty at a strong value must change a greedy list, where every line repeats the same tokens. Greedy is
+# not reproducible on a batched fp8 server (Chutes: top_k 1 gave 2 answers in 6), so agreement means at most
+# two answers or a shared 6-token prefix, and ignoring means the spread of unconstrained sampling
+SCREEN_TRUNCATE = {"top_k": 1, "top_p": 0.001, "min_p": 1.0}
+SCREEN_PENALTY = {"presence_penalty": 2.0, "frequency_penalty": 2.0, "repetition_penalty": 2.0}
+SCREEN_SEEDS = 6
+
+class ApiError(Exception):
+    pass
+
+class OpenAIBackend:
+    def __init__(self, opts, tokenizer, template_vars, journal):
+        import requests
+        self.requests = requests
+        o = dict(OPENAI_DEFAULTS, **opts)
+        assert o.get("base_url") and o.get("model"), "--openai needs base_url and model"
+        assert o["tokens"] in ("auto", "ids", "text"), "--openai tokens: auto, ids or text"
+        self.o, self.tokenizer, self.tv = o, tokenizer, template_vars
+        self.url = o["base_url"].rstrip("/")
+        key = os.environ.get(o["api_key_env"])
+        self.headers = {"Authorization": f"Bearer {key}"} if key else {}
+        self.journal_path, self.lock = journal, threading.Lock()
+        self.journal = {}
+        if os.path.isfile(journal):
+            with open(journal) as f:
+                for line in f:
+                    e = json.loads(line)
+                    self.journal[e["key"]] = e["response"]
+        self.info = {"base_url": self.url, "model": o["model"], "body": o["body"],
+                     "queried": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        models = self.get("/models")
+        entry = next((m for m in (models or {}).get("data", []) if m.get("id") == o["model"]), None)
+        self.info["model_entry"] = entry
+        # OpenRouter: every provider serving the model, with its declared quantization and parameters
+        eps = self.get(f"/models/{o['model']}/endpoints")
+        self.info["endpoints"] = eps.get("data") if isinstance(eps, dict) else None
+        self.max_len = entry and (entry.get("max_model_len") or entry.get("context_length"))
+        self.ids = o["tokens"] == "ids" or o["tokens"] == "auto" and self.takes_ids()
+        self.info["token_mode"] = "ids" if self.ids else "text"
+        self.passed, self.screened, self.screened_for = set(), {}, None
+        self.stats = collections.Counter()
+        print(f" -- {self.url} {o['model']}: prompts as {self.info['token_mode']}, context {self.max_len or 'unreported'}, "
+              f"{len(self.journal)} journaled responses", flush = True)
+
+    def get(self, path):
+        try:
+            r = self.requests.get(self.url + path, headers = self.headers, timeout = 60)
+            return r.json() if r.ok else None
+        except (self.requests.RequestException, ValueError):
+            return None
+
+    def post(self, body):
+        try:
+            r = self.requests.post(self.url + "/completions", json = body, headers = self.headers, timeout = self.o["timeout"])
+        except self.requests.RequestException as e:
+            raise ApiError(f"{type(e).__name__}: {e}")
+        try:
+            resp = r.json()
+        except ValueError:
+            raise ApiError(f"HTTP {r.status_code}, not JSON: {r.text[:200]}")
+        if not r.ok or "error" in resp or not resp.get("choices"):
+            raise ApiError(f"HTTP {r.status_code}: {json.dumps(resp.get('error', resp))[:400]}")
+        return resp
+
+    def post_retried(self, body):
+        """post, retrying what fails in transit (rate limits, provider errors), for requests with no row to fail"""
+        for attempt in range(self.o["attempts"]):
+            try:
+                return self.post(body)
+            except ApiError as e:
+                if attempt + 1 == self.o["attempts"]:
+                    raise
+                print(f"    screening attempt {attempt + 1}/{self.o['attempts']}: {e}", flush = True)
+                time.sleep(min(60, 2 ** (attempt + 1)) * (0.5 + random.random()))
+
+    def render(self, text):
+        kw = dict(self.tv, enable_thinking = False)
+        try:
+            return self.tokenizer.hf_chat_template([{"role": "user", "content": text}], add_generation_prompt = True, **kw)[0].tolist()
+        except Exception:
+            return self.tokenizer.hf_chat_template([{"role": "user", "content": text}], add_generation_prompt = True, **self.tv)[0].tolist()
+
+    def takes_ids(self):
+        try:
+            c = self.post(self.body(self.render("hi"), {"max_tokens": 1}, ids = True))["choices"][0]
+        except ApiError:
+            return False
+        return c.get("token_ids") is not None
+
+    def body(self, input_ids, sp, ids = None):
+        ids = self.ids if ids is None else ids
+        b = {**self.o["body"], **{k: v for k, v in sp.items() if k != "stop_token_ids"}, "model": self.o["model"]}
+        if ids:
+            b.update(prompt = input_ids, return_token_ids = True)
+            if sp.get("stop_token_ids"):
+                b["stop_token_ids"] = sp["stop_token_ids"]
+        else:
+            text = self.tokenizer.decode(torch.tensor([input_ids]), decode_special_tokens = True)[0]
+            if self.tokenizer.encode(text, encode_special_tokens = True)[0].tolist() != input_ids:
+                raise RuntimeError("a prompt does not survive decode and re-encode here; use an endpoint that takes token ids")
+            b["prompt"] = text
+        return b
+
+    def params(self, mode, max_new_tokens, prompt_len, stop_ids, seed):
+        kw = sampling_kw(mode)
+        bad = set(kw) - OPENAI_SAMPLING
+        assert not bad, f"sampling parameters with no OpenAI-API equivalent: {sorted(bad)}"
+        # Unreported context: the endpoint refuses what does not fit, and that request fails like any other
+        room = max_new_tokens if not self.max_len else max(1, min(max_new_tokens, self.max_len - prompt_len))
+        return {**kw, "max_tokens": room, "seed": seed, "stop_token_ids": stop_ids}
+
+    def parse(self, input_ids, sp, resp):
+        """A response's token ids and finish, or ApiError when it is not a raw completion of input_ids"""
+        c, u = resp["choices"][0], resp.get("usage") or {}
+        fin = c.get("finish_reason")
+        if fin not in ("stop", "length"):
+            raise ApiError(f"finish_reason {fin}")
+        if c.get("reasoning") or c.get("reasoning_content"):
+            raise ApiError("the endpoint split reasoning out of the completion: it applied a template or reasoning parser of its own")
+        if u.get("prompt_tokens") != len(input_ids):
+            raise ApiError(f"the endpoint counted {u.get('prompt_tokens')} prompt tokens for {len(input_ids)}: "
+                           f"it rendered or tokenized the prompt itself")
+        if self.ids:
+            out = list(c["token_ids"])
+            if c.get("prompt_token_ids") is not None and list(c["prompt_token_ids"]) != input_ids:
+                raise ApiError("the endpoint's prompt token ids differ from the ones sent")
+            if fin == "stop" and out and out[-1] in (sp.get("stop_token_ids") or []):
+                out = out[:-1]
+        else:
+            text = c.get("text") or ""
+            out = self.tokenizer.encode(text, encode_special_tokens = True)[0].tolist() if text else []
+            n = u.get("completion_tokens")
+            if n is None:
+                raise ApiError("the endpoint reports no completion token count, so a partial completion would go unseen")
+            # The count includes a stop token the text leaves out; retokenizing may merge or split a few
+            d = n - len(out) - (fin == "stop")
+            if abs(d) > max(2, 0.02 * n):
+                raise ApiError(f"the endpoint generated {n} tokens and returned text of {len(out)}: part of the completion is missing")
+            with self.lock:
+                self.stats["retokenized_delta"] += abs(d)
+                self.stats["retokenized_rows"] += d != 0
+        return out, "stop_token" if fin == "stop" else "max_new_tokens", resp.get("provider") or "endpoint"
+
+    def complete(self, i, n, input_ids, sp):
+        body = self.body(input_ids, sp)
+        key = hashlib.sha256(json.dumps(body, sort_keys = True).encode()).hexdigest()
+        last = None
+        for attempt in range(self.o["attempts"]):
+            if attempt:
+                time.sleep(min(60, 2 ** attempt) * (0.5 + random.random()))
+            cached = self.journal.get(key)
+            try:
+                resp = cached or self.post(body)
+                out, eos, prov = self.parse(input_ids, sp, resp)
+                if prov not in self.passed:
+                    raise ApiError(f"served by {prov}, which was not screened (pin providers in --openai body, e.g. "
+                                   f"OpenRouter's provider.only)")
+            except ApiError as e:
+                last = e
+                if cached:
+                    self.journal.pop(key, None)
+                print(f"    {i:3} attempt {attempt + 1}/{self.o['attempts']}: {e}", flush = True)
+                continue
+            with self.lock:
+                if not cached:
+                    self.journal[key] = resp
+                    with open(self.journal_path, "a") as f:
+                        f.write(json.dumps({"key": key, "response": resp}) + "\n")
+                self.stats[f"rows_{prov}"] += 1
+                self.stats["cost"] += (resp.get("usage") or {}).get("cost") or 0
+                self.stats["done"] += 1
+                print(f"    api {self.stats['done']:4}/{n} {prov:16.16s} ctx {len(input_ids):6}  resp {len(out):5} ({eos})"
+                      f"{' journaled' if cached else ''}", flush = True)
+            return out, eos, {"api": {"provider": prov, "id": resp.get("id")}}
+        raise ApiError(f"{self.o['attempts']} attempts, the last: {last}")
+
+    # Screening
+
+    def sample(self, input_ids, sp, seeds):
+        """[(provider, token ids)] for one prompt under each seed"""
+        res = []
+        for s in seeds:
+            out, _, prov = self.parse(input_ids, sp, self.post_retried(self.body(input_ids, {**sp, "seed": s})))
+            res.append((prov, out))
+        return res
+
+    def screen_one(self, used):
+        """Screens whichever provider this endpoint routes to: {test: verdict}, the provider, and whether it passed"""
+        # Open-ended enough that six seeds disagree within 12 tokens even on a 0.6B ("one random word" does not:
+        # Qwen3-0.6B says "apple" six times in six)
+        word = self.render("Write the first sentence of a story about anything you like.")
+        fruit = self.render("List 25 different fruits, one per line, with no numbering.")
+        seeds = range(1, SCREEN_SEEDS + 1)
+        res, provs = {}, set()
+        base = self.sample(word, {"temperature": 1.0, "max_tokens": 12}, seeds)
+        provs |= {p for p, _ in base}
+        distinct = len({tuple(o) for _, o in base})
+        res["temperature"] = {"ok": distinct > 1, "distinct": distinct, "of": SCREEN_SEEDS}
+        res["temperature"]["ok"] = distinct > SCREEN_SEEDS // 2
+        for k in sorted(set(used) & set(SCREEN_TRUNCATE)):
+            got = self.sample(word, {"temperature": 1.0, "max_tokens": 12, k: SCREEN_TRUNCATE[k]}, seeds)
+            provs |= {p for p, _ in got}
+            outs = [o for _, o in got]
+            d = len({tuple(o) for o in outs})
+            prefix = next((j for j in range(min(map(len, outs))) if len({o[j] for o in outs}) > 1), min(map(len, outs)))
+            v = {"ok": distinct > SCREEN_SEEDS // 2 and (d <= 2 or prefix >= 6), "distinct": d, "of": SCREEN_SEEDS,
+                 "shared_prefix": prefix, "value": SCREEN_TRUNCATE[k]}
+            if not v["ok"] and (d <= SCREEN_SEEDS // 2 or distinct <= SCREEN_SEEDS // 2):
+                v["inconclusive"] = "greedy is not reproducible here" if distinct > SCREEN_SEEDS // 2 else "sampling barely varies here"
+            res[k] = v
+        pens = sorted(set(used) & set(SCREEN_PENALTY))
+        if pens:
+            # Two greedy baselines: only the prefix they agree on counts, so batch-order noise reads as neither.
+            # A penalty this strong changes the list by its second line (~4 tokens); a shorter agreement says nothing
+            a, b = (self.sample(fruit, {"temperature": 0.0, "max_tokens": 64}, [s])[0] for s in (1, 2))
+            provs |= {a[0], b[0]}
+            agree = next((j for j, (x, y) in enumerate(zip(a[1], b[1])) if x != y), min(len(a[1]), len(b[1])))
+            for k in pens:
+                p, o = self.sample(fruit, {"temperature": 0.0, "max_tokens": 64, k: SCREEN_PENALTY[k]}, [1])[0]
+                provs.add(p)
+                res[k] = {"ok": agree >= 8 and o[:agree] != a[1][:agree], "baseline_agree": agree, "value": SCREEN_PENALTY[k],
+                          **({"inconclusive": "greedy is not reproducible here"} if agree < 8 else {})}
+        if len(provs) > 1:
+            return res, None, f"screening was served by {sorted(provs)}: pin one provider per screen"
+        prov = provs.pop()
+        bad = [k for k, v in res.items() if not v["ok"] and "inconclusive" not in v]
+        unsure = [k for k, v in res.items() if "inconclusive" in v]
+        why = "; ".join(([f"ignores {', '.join(bad)}"] if bad else []) + ([f"could not test {', '.join(unsure)}"] if unsure else []))
+        return res, prov, why or None
+
+    def screen(self, used):
+        """used: every non-neutral sampling parameter the run sets. With OpenRouter's provider.only listing several,
+        each is screened alone"""
+        only = (self.o["body"].get("provider") or {}).get("only") or []
+        pins = [[p] for p in only] if len(only) > 1 else [None]
+        for pin in pins:
+            label = pin[0] if pin else "routed"
+            saved = self.o["body"]
+            if pin:
+                self.o["body"] = {**saved, "provider": {**saved["provider"], "only": pin}}
+            try:
+                res, prov, why = self.screen_one(used)
+            except ApiError as e:
+                res, prov, why = {}, None, f"screening failed: {e}"
+            finally:
+                self.o["body"] = saved
+            self.screened[label] = {"provider": prov, "tests": res, "passed": why is None, **({"why": why} if why else {})}
+            print(f" -- screened {label}: {prov or '?'} {'passed' if why is None else 'REFUSED, ' + why}  "
+                  f"{json.dumps(res)}", flush = True)
+            if why is None:
+                self.passed.add(prov)
+        if not self.passed:
+            raise SystemExit("no provider passed screening; nothing generated")
+
+    def run(self, requests):
+        """requests: [(input_ids list, request params)] -> [(response_ids, eos_reason, row extras)]"""
+        used = {k for _, sp in requests for k, v in sp.items() if k in OPENAI_SAMPLING - {"temperature"}
+                and v not in OPENAI_NEUTRAL[k]}
+        if self.screened_for is None or not used <= self.screened_for:
+            self.passed, self.screened_for = set(), used
+            self.screen(used)
+        n = len(requests)
+        with concurrent.futures.ThreadPoolExecutor(self.o["concurrency"]) as ex:
+            futs = [ex.submit(self.complete, i, n, ids, sp) for i, (ids, sp) in enumerate(requests)]
+        res, failed = [], []
+        for i, f in enumerate(futs):
+            try:
+                res.append(f.result())
+            except ApiError as e:
+                failed.append((i, e))
+        if failed:
+            raise RuntimeError(f"{len(failed)} of {n} requests failed (first: conversation {failed[0][0]}, {failed[0][1]}); "
+                               f"the rest are journaled in {self.journal_path} and a rerun reuses them")
+        return res
+
+    def provenance(self):
+        return {**self.info, "screening": self.screened, "stats": dict(self.stats)}
 
 def generate(generator, config, tokenizer, convs, template_vars, max_new_tokens, seed):
     """convs: list of (meta, messages, tools). Returns trace rows."""
-    if isinstance(generator, VllmBackend):
-        return generate_vllm(generator, config, tokenizer, convs, template_vars, max_new_tokens, seed)
+    if isinstance(generator, (VllmBackend, OpenAIBackend)):
+        return generate_batched(generator, config, tokenizer, convs, template_vars, max_new_tokens, seed)
     pending = {}
     for i, (meta, msgs, tools) in enumerate(convs):
         kw = dict(meta.get("template_vars") or template_vars, **({"tools": tools} if tools else {}))
@@ -694,7 +1005,7 @@ def generate(generator, config, tokenizer, convs, template_vars, max_new_tokens,
     return rows
 
 
-def generate_vllm(backend, config, tokenizer, convs, template_vars, max_new_tokens, seed):
+def generate_batched(backend, config, tokenizer, convs, template_vars, max_new_tokens, seed):
     reqs, metas = [], []
     for i, (meta, msgs, tools) in enumerate(convs):
         kw = dict(meta.get("template_vars") or template_vars, **({"tools": tools} if tools else {}))
@@ -704,10 +1015,10 @@ def generate_vllm(backend, config, tokenizer, convs, template_vars, max_new_toke
                                                zlib.crc32(f"{seed}|{i}".encode()))))
         metas.append((meta, mode))
     rows = []
-    for i, ((input_ids, _), (meta, mode), (resp, eos)) in enumerate(zip(reqs, metas, backend.run(reqs))):
+    for i, ((input_ids, _), (meta, mode), (resp, eos, extra)) in enumerate(zip(reqs, metas, backend.run(reqs))):
         print(f"    {i:3} {meta['slice']:9s} {meta.get('lang', ''):3s} ctx {len(input_ids):5}  resp {len(resp):5} ({eos})", flush = True)
         if resp:
-            rows.append({**meta, "eos_reason": eos, **({"sampling_mode": mode} if mode is not None else {}),
+            rows.append({**meta, "eos_reason": eos, **({"sampling_mode": mode} if mode is not None else {}), **extra,
                          "input_ids": input_ids, "response_ids": resp})
     return rows
 
@@ -754,10 +1065,16 @@ def main(args):
         config = Config.from_directory(args.model_dir)
         tokenizer = Tokenizer.from_config(config)
         generator = VllmBackend(args.model_dir, args.vllm, args.seed)
+    elif args.backend == "openai":
+        # -m supplies the tokenizer, chat template and stop tokens; config and tokenizer files are enough
+        config = Config.from_directory(args.model_dir)
+        tokenizer = Tokenizer.from_config(config)
     else:
         model, config, cache, tokenizer = model_init.init(args)[:4]
         generator = Generator(model = model, cache = cache, tokenizer = tokenizer, max_chunk_size = 2048)
     tv = probe_template_vars(tokenizer, dict(DEFAULT_TEMPLATE_VARS, **args.template_vars))
+    if args.backend == "openai" and not args.repack:
+        generator = OpenAIBackend(args.openai, tokenizer, tv, f"{args.output}_api.jsonl")
     rng = random.Random(args.seed)
     purpose = args.docs
     use_pool(purpose)
@@ -816,7 +1133,7 @@ def main(args):
                 convs = [(meta, match_reasoning(msgs, meta.get("template_vars", tv)), tools) for meta, msgs, tools in convs]
             print(f" -- slice {sl}: {len(convs)} conversations", flush = True)
             rows = generate(generator, config, tokenizer, convs, tv, args.max_new_tokens, f"{args.seed}|{sl}")
-            write_trace(f"{args.output}_{sl}.json", args, tokenizer, tv, rows, {"slice": sl, "docs": purpose})
+            write_trace(f"{args.output}_{sl}.json", args, tokenizer, tv, rows, {"slice": sl, "docs": purpose}, generator)
         return
 
     # --- calibration: packed mix ---
@@ -896,7 +1213,7 @@ def main(args):
         print(f" -- generating {len(convs)} conversations", flush = True)
         rows = generate(generator, config, tokenizer, convs, tv, args.max_new_tokens, f"{args.seed}|cal")
         source_trace = f"{args.output}_cal.json"
-        write_trace(source_trace, args, tokenizer, tv, rows, {"slice": "cal", "docs": purpose})
+        write_trace(source_trace, args, tokenizer, tv, rows, {"slice": "cal", "docs": purpose}, generator)
 
     # Pack: each conversational slice's streams into fixed-width rows, up to its row budget
     from exllamav3.conversion.calibration_data import get_default_calibration, pack_rows, tail_windows
@@ -968,8 +1285,10 @@ def main(args):
     print(f" -- {R} x {C} calibration rows -> {args.cal_out}; composition {comp}")
 
 
-def write_trace(path, args, tokenizer, tv, rows, meta):
+def write_trace(path, args, tokenizer, tv, rows, meta, generator = None):
+    gen = generator.provenance() if hasattr(generator, "provenance") else None
     out = {"model": args.model_dir, "vocab_size": tokenizer.actual_vocab_size, "template_vars": tv,
+           **({"generator": gen} if gen else {}),
            "sampling": PROFILE or args.sampling or "exllamav3 DefaultSampler (temperature 0.8, min_p 0.08)",
            "meta": {**meta, "rows": len(rows),
                     "input_tokens": sum(len(r["input_ids"]) for r in rows),
@@ -983,8 +1302,13 @@ def write_trace(path, args, tokenizer, tv, rows, meta):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev = False)
     model_init.add_args(parser, default_cache_size = 65536)
-    parser.add_argument("--backend", type = str, default = "exllamav3", choices = ["exllamav3", "vllm"],
-                        help = "Generation backend. vllm loads -m as vLLM does (e.g. an FP8 checkpoint), one engine per process")
+    parser.add_argument("--backend", type = str, default = "exllamav3", choices = ["exllamav3", "vllm", "openai"],
+                        help = "Generation backend. vllm loads -m as vLLM does (e.g. an FP8 checkpoint), one engine per process; "
+                               "openai sends -m's rendered prompts to an OpenAI-compatible completions endpoint (--openai)")
+    parser.add_argument("--openai", type = json.loads, default = {},
+                        help = "openai backend, JSON over OPENAI_DEFAULTS: base_url and model (required), api_key_env, "
+                               "body (merged into every request, e.g. OpenRouter's {\"provider\": {\"only\": [\"mancer/fp8\"]}}), "
+                               "concurrency, attempts, timeout, tokens (auto, ids or text)")
     parser.add_argument("--vllm", type = json.loads, default = {},
                         help = "vLLM engine arguments, JSON, over VLLM_DEFAULTS; Qwen3.8-27B FP8 on 2x16 GB: "
                                "'{\"max_num_batched_tokens\": 1024, \"enforce_eager\": true, \"gpu_memory_utilization\": 0.968}'")
